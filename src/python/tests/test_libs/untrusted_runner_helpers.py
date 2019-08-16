@@ -107,7 +107,7 @@ def _which(prog):
 
 @unittest.skipIf(not os.getenv('UNTRUSTED_RUNNER_TESTS'),
                  'Skipping untrusted runner tests.')
-@test_utils.with_cloud_emulators('datastore')
+@test_utils.with_cloud_emulators('datastore', 'pubsub')
 class UntrustedRunnerIntegrationTest(unittest.TestCase):
   """Base class for doing integration testing of untrusted_runner."""
 
@@ -156,6 +156,7 @@ class UntrustedRunnerIntegrationTest(unittest.TestCase):
         key_contents=key_contents,
         id='project').put()
 
+    test_utils.setup_pubsub('test-clusterfuzz')
     host.init()
 
   @classmethod
