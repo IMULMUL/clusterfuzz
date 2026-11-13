@@ -17,10 +17,10 @@ import datetime
 
 from flask import request
 
-from base import tasks
-from base import utils
-from datastore import data_types
-from datastore import ndb_utils
+from clusterfuzz._internal.base import tasks
+from clusterfuzz._internal.base import utils
+from clusterfuzz._internal.datastore import data_types
+from clusterfuzz._internal.datastore import ndb_utils
 from handlers import base_handler
 from libs import filters
 from libs import handler
@@ -101,6 +101,7 @@ class Handler(base_handler.Handler):
   """Handler that gets the bot list."""
 
   @handler.get(handler.HTML)
+  @handler.oauth
   @handler.check_admin_access_if_oss_fuzz
   @handler.check_user_access(need_privileged_access=False)
   def get(self):
@@ -135,7 +136,7 @@ class DeadBotsHandler(base_handler.Handler):
     if utils.is_chromium():
       heartbeats = ndb_utils.get_all_from_model(data_types.Heartbeat)
     else:
-      raise helpers.EarlyExitException('Dead bots list unavailable.', 400)
+      raise helpers.EarlyExitError('Dead bots list unavailable.', 400)
 
     result = {}
     alive_cutoff = _get_alive_cutoff()

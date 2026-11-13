@@ -17,16 +17,16 @@ import json
 
 from flask import request
 
-from datastore import data_handler
-from datastore import data_types
-from datastore import ndb_utils
+from clusterfuzz._internal.datastore import data_handler
+from clusterfuzz._internal.datastore import data_types
+from clusterfuzz._internal.datastore import ndb_utils
+from clusterfuzz._internal.metrics import crash_stats as crash_stats_common
 from handlers import base_handler
 from libs import crash_access
 from libs import crash_stats
 from libs import filters
 from libs import handler
 from libs import helpers
-from metrics import crash_stats as crash_stats_common
 
 PAGE_SIZE = 10
 DEFAULT_DAYS_FOR_BY_HOURS = 3
@@ -200,7 +200,7 @@ def get_result():
         offset=(page - 1) * PAGE_SIZE,
         limit=PAGE_SIZE)
   except ValueError:
-    raise helpers.EarlyExitException('Invalid filters', 400)
+    raise helpers.EarlyExitError('Invalid filters', 400)
 
   attach_testcases(rows)
 
@@ -232,6 +232,7 @@ class Handler(base_handler.Handler):
 
   @handler.get(handler.HTML)
   @handler.unsupported_on_local_server
+  @handler.oauth
   def get(self):
     """Get and render the crash stats in HTML."""
     result, params = get_result()

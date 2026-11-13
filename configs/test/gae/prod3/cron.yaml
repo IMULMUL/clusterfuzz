@@ -34,10 +34,10 @@ cron:
     schedule: every 1 minutes
     target: cron-service
 
-  - description: Make corpus backups public.
-    url: /corpus-backup/make-public
-    schedule: every day 03:00
-    target: cron-service
+  # - description: Make corpus backups public.
+  #  url: /corpus-backup/make-public
+  #  schedule: every day 03:00
+  #  target: cron-service
 
   # Run fuzzer coverage task right before the corpus pruning task.
   - description: Obtain code coverage information from the coverage GCS bucket.
@@ -70,11 +70,6 @@ cron:
     schedule: every day 01:00
     target: cron-service
 
-  - description: Manage VMs.
-    url: /manage-vms
-    schedule: every 30 minutes
-    target: cron-service
-
   - description: Schedule corpus pruning task.
     url: /schedule-corpus-pruning
     schedule: every day 19:00
@@ -84,11 +79,6 @@ cron:
     url: /schedule-impact-tasks
     schedule: every day 09:00
     timezone: US/Pacific
-    target: cron-service
-
-  - description: Train ML model.
-    url: /schedule-ml-train-tasks
-    schedule: every tuesday 09:00
     target: cron-service
 
   - description: Schedule progression tasks.

@@ -13,16 +13,17 @@
 # limitations under the License.
 """Manage job types."""
 
-import six
-
 from flask import request
 from google.cloud import ndb
 
-from base import tasks
-from datastore import data_handler
-from datastore import data_types
-from datastore import ndb_utils
-from fuzzing import fuzzer_selection
+from clusterfuzz._internal.base import tasks
+from clusterfuzz._internal.config import local_config
+from clusterfuzz._internal.datastore import data_handler
+from clusterfuzz._internal.datastore import data_types
+from clusterfuzz._internal.datastore import ndb_utils
+from clusterfuzz._internal.fuzzing import fuzzer_selection
+from clusterfuzz._internal.google_cloud_utils import blobs
+from clusterfuzz._internal.google_cloud_utils import storage
 from handlers import base_handler
 from libs import filters
 from libs import form
@@ -42,7 +43,7 @@ FILTERS = [
 def get_queues():
   """Return list of task queues."""
   queues = []
-  for name, display_name in six.iteritems(tasks.TASK_QUEUE_DISPLAY_NAMES):
+  for name, display_name in tasks.TASK_QUEUE_DISPLAY_NAMES.items():
     queue = {
         'name': name,
         'display_name': display_name,
@@ -58,8 +59,10 @@ def _job_to_dict(job):
   result = job.to_dict()
   result['id'] = job.key.id()
   # Adding all associated fuzzers with each job.
-  fuzzers = data_types.Fuzzer.query().filter(data_types.Fuzzer.jobs == job.name)
-  result['fuzzers'] = [fuzzer.name for fuzzer in fuzzers]
+  fuzzers = data_types.Fuzzer.query()
+  result['fuzzers'] = [
+      fuzzer.name for fuzzer in fuzzers if job.name in fuzzer.jobs
+  ]
   return result
 
 
@@ -92,6 +95,7 @@ class Handler(base_handler.Handler):
   """View job handler."""
 
   @handler.get(handler.HTML)
+  @handler.oauth
   @handler.check_user_access(need_privileged_access=True)
   def get(self):
     """Handle a get request."""
@@ -102,6 +106,12 @@ class Handler(base_handler.Handler):
         fuzzer.name for fuzzer in data_types.Fuzzer.query(projection=['name'])
     ]
     result, params = get_results()
+
+    bucket = local_config.ProjectConfig().get('custom_builds.bucket')
+    if not bucket:
+      bucket = storage.blobs_bucket()
+    upload_info = gcs.prepare_upload(bucket,
+                                     blobs.generate_new_blob_name())._asdict()
 
     return self.render(
         'jobs.html',
@@ -114,7 +124,7 @@ class Handler(base_handler.Handler):
                 'queues': queues,
                 'update_job_url': '/update-job',
                 'update_job_template_url': '/update-job-template',
-                'upload_info': gcs.prepare_blob_upload()._asdict(),
+                'upload_info': upload_info,
             },
             'params': params,
         })
@@ -130,24 +140,24 @@ class UpdateJob(base_handler.GcsUploadHandler):
     """Handle a post request."""
     name = request.form.get('name')
     if not name:
-      raise helpers.EarlyExitException('Please give this job a name!', 400)
+      raise helpers.EarlyExitError('Please give this job a name!', 400)
 
     if not data_types.Job.VALID_NAME_REGEX.match(name):
-      raise helpers.EarlyExitException(
+      raise helpers.EarlyExitError(
           'Job name can only contain letters, numbers, dashes and underscores.',
           400)
 
-    fuzzers = request.form.get('fuzzers', []).split(',')
+    fuzzers_string = request.form.get('fuzzers')
+    fuzzers = fuzzers_string.split(',') if fuzzers_string else []
     templates = request.form.get('templates', '').splitlines()
     for template in templates:
       if not data_types.JobTemplate.query(
           data_types.JobTemplate.name == template).get():
-        raise helpers.EarlyExitException('Invalid template name(s) specified.',
-                                         400)
+        raise helpers.EarlyExitError('Invalid template name(s) specified.', 400)
 
     new_platform = request.form.get('platform')
     if not new_platform or new_platform == 'undefined':
-      raise helpers.EarlyExitException('No platform provided for job.', 400)
+      raise helpers.EarlyExitError('No platform provided for job.', 400)
 
     description = request.form.get('description', '')
     environment_string = request.form.get('environment_string', '')
@@ -214,16 +224,16 @@ class UpdateJobTemplate(base_handler.Handler):
     """Handle a post request."""
     name = request.form.get('name')
     if not name:
-      raise helpers.EarlyExitException('Please give this template a name!', 400)
+      raise helpers.EarlyExitError('Please give this template a name!', 400)
 
     if not data_types.Job.VALID_NAME_REGEX.match(name):
-      raise helpers.EarlyExitException(
+      raise helpers.EarlyExitError(
           'Template name can only contain letters, numbers, dashes and '
           'underscores.', 400)
 
     environment_string = request.form.get('environment_string')
     if not environment_string:
-      raise helpers.EarlyExitException(
+      raise helpers.EarlyExitError(
           'No environment string provided for job template.', 400)
 
     template = data_types.JobTemplate.query(
@@ -259,7 +269,7 @@ class DeleteJobHandler(base_handler.Handler):
     key = helpers.get_integer_key(request)
     job = ndb.Key(data_types.Job, key).get()
     if not job:
-      raise helpers.EarlyExitException('Job not found.', 400)
+      raise helpers.EarlyExitError('Job not found.', 400)
 
     # Delete from fuzzers' jobs' list.
     for fuzzer in ndb_utils.get_all_from_model(data_types.Fuzzer):
@@ -289,3 +299,22 @@ class JsonHandler(base_handler.Handler):
     """Get and render the jobs in JSON."""
     result, _ = get_results()
     return self.render_json(result)
+
+
+class GetEnvironmentHandler(base_handler.Handler):
+  """Handler that gets the computed environment for a job."""
+
+  @handler.get(handler.JSON)
+  @handler.check_user_access(need_privileged_access=True)
+  def get(self):
+    """Get and render the computed environment in JSON."""
+    name = request.args.get('name')
+    if not name:
+      raise helpers.EarlyExitError('No job name provided.', 400)
+
+    job = data_types.Job.query(data_types.Job.name == name).get()
+    if not job:
+      raise helpers.EarlyExitError('Job not found.', 404)
+
+    environment = job.get_environment()
+    return self.render_json({'environment': environment})

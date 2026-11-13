@@ -112,6 +112,9 @@
         </span>
       </template>
       <paper-input value="{{uploadParams.file}}" no-label-float always-float-label$="false" type="file" id="file" label="File" title="Test case file or archive. If an archive is uploaded, a file containing &quot;fuzz-&quot;, &quot;run&quot;, &quot;index.&quot;, or &quot;crash.&quot; will be treated as the test case and the rest as resources."></paper-input>
+      <template is="dom-if" if="[[shouldShowFiletypePicker(uploadParams.file)]]">
+        <p>Test case file or archive. If an archive is uploaded, a file containing 'fuzz-', 'run', 'index.', or 'crash.'; will be treated as the test case and the rest as resources.</p>
+      </template>
       <div class="inline wide">
         <paper-dropdown-menu
             class="dropdown-filter"
@@ -189,11 +192,13 @@
           </paper-dropdown-menu>
         </template>
       </div>
-      <template is="dom-if" if="[[showWarning(uploadParams.job)]]">
+      <template is="dom-if" if="[[fieldValues.isChromium]]">
         <div class="warning">
-          <b>WARNING</b>: Please be mindful of what you upload, as ClusterFuzz doesn't support untrusted workloads.<br/>
-          Unless the PoC is very obviously harmless, please only upload them to the following sandboxed job types:<br/>
-          [[formatSandboxedJobs(fieldValues.sandboxedJobs)]]
+        <span><strong>WARNING</strong>: ClusterFuzz only partially supports untrusted workloads.<br></span>
+          ClusterFuzz supports untrusted workloads when the platform is Linux<br>
+          If your upload does not use Linux as the platform, Clusterfuzz will treat the input testcase as trusted,
+          and therefore run with privileged jobs. Only upload this testcase if you trust it enough to run on your own machine.<br>
+          To confirm this testcase is trusted, you must fill out the extra field confirming so.
         </div>
       </template>
       <div class="inline narrow">
@@ -225,6 +230,7 @@
       </template>
       <template is="dom-if" if="[[fieldValues.isChromium]]">
         <paper-checkbox value="true" checked="{{uploadParams.highEnd}}">Use a multi-core bot (linux only).</paper-checkbox>
+        <paper-input value="{{uploadParams.trustedAgreement}}" label="Type in 'This testcase is safe to run' to run trusted testcases on trusted jobs."></paper-input>
       </template>
       <br/>
       <paper-button class="get-link-button" slot="more-buttons" on-tap="generatePermalink">Permalink</paper-button>
@@ -251,7 +257,7 @@
             value: [
                 'job', 'target', 'multiple', 'http', 'highEnd', 'issue',
                 'revision', 'timeout', 'retries', 'updateIssue', 'args', 'cmd',
-                'platform', 'gestures', 'testcaseId']
+                'platform', 'gestures', 'testcaseId', 'trustedAgreement']
           },
           uploadParams: {
             type: Object,
@@ -272,6 +278,13 @@
         super.ready();
         this.uploadParams = window.query.toObject(
             window.query.get(), this.paramKeys);
+      }
+
+      shouldShowFiletypePicker(filePath) {
+        if (!filePath) {
+          return false;
+        }
+        return !filePath.includes('.html') && !filePath.includes('.js') && !filePath.includes('.pdf');
       }
 
       computeGcsBody() {
@@ -338,10 +351,13 @@
         if (!job)
           return false;
 
-        let jobLower = job.toLowerCase();
-        return (jobLower.includes('libfuzzer') ||
-                jobLower.includes('afl') ||
-                jobLower.includes('honggfuzz'));
+        for (const key in this.fieldValues.targets) {
+          if (job.toLowerCase().includes(key.toLowerCase())) {
+            return true;
+          }
+        }
+
+        return false;
       }
 
       shouldShowFuzzers(job) {
@@ -356,15 +372,13 @@
           return [];
 
         let jobLower = job.toLowerCase();
-        if (jobLower.includes('libfuzzer')) {
-          return this.fieldValues.libfuzzerTargets;
-        } else if (jobLower.includes('afl')) {
-          return this.fieldValues.aflTargets;
-        } else if (jobLower.includes('honggfuzz')) {
-          return this.fieldValues.honggfuzzTargets;
-        } else {
-          return [];
+        for (const [engine, targets] of Object.entries(this.fieldValues.targets)) {
+          if (jobLower.includes(engine.toLowerCase())) {
+            return targets;
+          }
         }
+
+        return [];
       }
 
       isAndroid(job) {
@@ -374,23 +388,6 @@
       generatePermalink() {
         window.location.href = '?upload=true&' + window.query.compute(
             this.uploadParams, this.paramKeys);
-      }
-
-      showWarning(job) {
-        let secureJobs = new Set(this.fieldValues.sandboxedJobs);
-        return this.fieldValues.isChromium && !secureJobs.has(job);
-      }
-
-      formatSandboxedJobs(jobs) {
-        if (!jobs) { return ''; }
-
-        let s = '';
-        for (let i=0;i<jobs.length;i++) {
-          if (i > 0) { s += ', '; }
-          if (i == (jobs.length - 1)) { s += 'and '; }
-          s += jobs[i]
-        }
-        return s;
       }
 
       onmatch(key) {

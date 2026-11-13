@@ -15,10 +15,11 @@
 
 import os
 import sys
+
 import yaml
 
-from local.butler import appengine
 from local.butler import common
+from local.butler import format as formatter
 
 _GOLINT_EXCEPTIONS = [
     'types.go'  # Not all model names conform to Go naming conventions.
@@ -47,9 +48,10 @@ _LICENSE_CHECK_IGNORE_DIRECTORIES = [
     'templates',  # Generated code.
 ]
 _LICENSE_CHECK_STRING = 'http://www.apache.org/licenses/LICENSE-2.0'
+_LICENSE_CHECK_IGNORE = 'LICENSE_CHECK_IGNORE'
 _PY_TEST_SUFFIX = '_test.py'
 _PY_INIT_FILENAME = '__init__.py'
-_YAML_EXCEPTIONS = ['bad.yaml']
+_YAML_EXCEPTIONS = ['bad.yaml', 'job_template.yaml']
 
 _error_occurred = False
 
@@ -89,7 +91,8 @@ def license_validate(file_path):
     return
 
   with open(file_path) as f:
-    if _LICENSE_CHECK_STRING in f.read():
+    data = f.read()
+    if _LICENSE_CHECK_STRING in data or _LICENSE_CHECK_IGNORE in data:
       return
 
   _error('Failed: Missing license header for %s.' % file_path)
@@ -141,8 +144,8 @@ def py_test_init_check(file_path):
 
   test_directory = os.path.dirname(file_path)
   if _PY_INIT_FILENAME not in os.listdir(test_directory):
-    _error('Failed: Missing {filename} file in test directory {dir}.'.format(
-        filename=_PY_INIT_FILENAME, dir=test_directory))
+    _error(f'Failed: Missing {_PY_INIT_FILENAME} file in test '
+           f'directory {test_directory}.')
 
 
 def yaml_validate(file_path):
@@ -159,37 +162,84 @@ def yaml_validate(file_path):
 
 def is_auto_generated_file(filepath):
   """Check if file is auto-generated so we dont lint it"""
-  return filepath.endswith('_pb2.py') or filepath.endswith('pb2_grpc.py') or \
-         os.path.dirname(filepath) == os.path.join('src', 'python', 'bot',
-                                                   'tokenizer', 'grammars')
+  return (filepath.endswith('_pb2.py') or filepath.endswith('pb2_grpc.py') or
+          os.path.dirname(filepath) == os.path.join(
+              'src', 'clusterfuzz', '_internal', 'bot', 'tokenizer',
+              'grammars'))
 
 
-def execute(_):
+def execute(args):
   """Lint changed code."""
   pythonpath = os.getenv('PYTHONPATH', '')
-  os.environ['PYTHONPATH'] = appengine.find_sdk_path() + ':' + pythonpath
-
-  if 'GOOGLE_CLOUDBUILD' in os.environ:
+  module_parent_path = os.path.abspath(os.path.join(__file__, '..', '..', '..'))
+  third_party_path = os.path.join(module_parent_path, 'third_party')
+  os.environ['PYTHONPATH'] = ':'.join(
+      [third_party_path, module_parent_path, pythonpath])
+  if args.path:
+    diff_command = f'git ls-files {os.path.abspath(args.path)}'
+  elif 'GOOGLE_CLOUDBUILD' in os.environ:
     # Explicitly compare against master if we're running on the CI
-    _, output = common.execute('git diff --name-only master FETCH_HEAD')
+    diff_command = 'git diff --name-only master FETCH_HEAD'
   else:
-    _, output = common.execute('git diff --name-only FETCH_HEAD')
+    if 'IS_GITHUB_ACTIONS' in os.environ:
+      # In GitHub actions, we want to compare against the base branch.
+      diff_command = 'git diff --name-only FETCH_HEAD'
+    else:
+      # If not, fall back to diffing against HEAD.
+      diff_command = 'git diff --name-only HEAD'
 
+  _, output = common.execute(diff_command)
   file_paths = [
       f.decode('utf-8') for f in output.splitlines() if os.path.exists(f)
   ]
-  py_changed_file_paths = [
-      f for f in file_paths
-      if f.endswith('.py') and not is_auto_generated_file(f)
-  ]
-  go_changed_file_paths = [f for f in file_paths if f.endswith('.go')]
-  yaml_changed_file_paths = [f for f in file_paths if f.endswith('.yaml')]
+
+  module_path = os.path.join(module_parent_path, 'clusterfuzz')
+
+  py_changed_tests = []
+  py_changed_noncf_module = []
+  py_changed_nontests = []
+  go_changed_file_paths = []
+  yaml_changed_file_paths = []
+  for file_path in file_paths:
+    if file_path.endswith('.go'):
+      go_changed_file_paths.append(file_path)
+      continue
+    if file_path.endswith('.yaml'):
+      yaml_changed_file_paths.append(file_path)
+      continue
+    if not file_path.endswith('.py') or is_auto_generated_file(file_path):
+      continue
+    if file_path.endswith('_test.py'):
+      py_changed_tests.append(file_path)
+    else:
+      py_changed_nontests.append(file_path)
+
+    if not os.path.abspath(file_path).startswith(module_path):
+      py_changed_noncf_module.append(file_path)
+
+  # Use --score no to make output less noisy.
+  base_pylint_cmd = 'pylint --score=no --jobs=0'
+  # Test for existence of files before running tools to avoid errors from
+  # misusing the tools.
+  if py_changed_nontests:
+    _execute_command_and_track_error(
+        f'{base_pylint_cmd} --ignore=protos,tests,grammars clusterfuzz ' +
+        ' '.join(py_changed_noncf_module))
+
+  if py_changed_tests:
+    _execute_command_and_track_error(
+        f'{base_pylint_cmd} --ignore=protos,grammars --max-line-length=240 '
+        '--disable no-member clusterfuzz._internal.tests')
+
+  py_changed_file_paths = py_changed_nontests + py_changed_tests
+  if py_changed_file_paths:
+    joined_paths = " ".join(py_changed_file_paths)
+    _execute_command_and_track_error(f'yapf -p -d {joined_paths}')
+    _execute_command_and_track_error(f'{formatter.ISORT_CMD} -c {joined_paths}')
+    if args.type_check:
+      _execute_command_and_track_error(f'pyright {joined_paths}')
 
   for file_path in py_changed_file_paths:
-    _execute_command_and_track_error('pylint ' + file_path)
-    _execute_command_and_track_error('yapf -d ' + file_path)
-
-    py_import_order(file_path)
     py_test_init_check(file_path)
 
   golint_path = os.path.join('local', 'bin', 'golint')

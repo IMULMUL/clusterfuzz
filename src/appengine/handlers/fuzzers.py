@@ -19,27 +19,32 @@ import io
 from flask import request
 from google.cloud import ndb
 
-from base import utils
-from datastore import data_handler
-from datastore import data_types
-from fuzzing import fuzzer_selection
-from google_cloud_utils import storage
+from clusterfuzz._internal.base import utils
+from clusterfuzz._internal.datastore import data_handler
+from clusterfuzz._internal.datastore import data_types
+from clusterfuzz._internal.fuzzing import fuzzer_selection
+from clusterfuzz._internal.google_cloud_utils import storage
+from clusterfuzz._internal.metrics import fuzzer_logs
+from clusterfuzz._internal.system import archive
 from handlers import base_handler
 from libs import access
 from libs import form
 from libs import gcs
 from libs import handler
 from libs import helpers
-from metrics import fuzzer_logs
-from system import archive
 
 ARCHIVE_READ_SIZE_LIMIT = 16 * 1024 * 1024
+FUZZER_FIELDS_EXCLUDED_FROM_LOG = [
+    'result', 'result_timestamp', 'console_output', 'return_code',
+    'sample_testcase', 'stats_columns', 'stats_column_descriptions'
+]
 
 
 class Handler(base_handler.Handler):
   """Manages fuzzers."""
 
   @handler.get(handler.HTML)
+  @handler.oauth
   @handler.check_admin_access_if_oss_fuzz
   @handler.check_user_access(need_privileged_access=False)
   def get(self):
@@ -80,7 +85,7 @@ class BaseEditHandler(base_handler.GcsUploadHandler):
     """Return a bytesio representing a GCS object."""
     data = storage.read_data(gcs_path)
     if not data:
-      raise helpers.EarlyExitException('Failed to read uploaded archive.', 500)
+      raise helpers.EarlyExitError('Failed to read uploaded archive.', 500)
 
     return io.BytesIO(data)
 
@@ -93,15 +98,26 @@ class BaseEditHandler(base_handler.GcsUploadHandler):
     if upload_info.size > ARCHIVE_READ_SIZE_LIMIT:
       return executable_path
 
-    if not executable_path:
-      executable_path = 'run'  # Check for default.
-
     reader = self._read_to_bytesio(upload_info.gcs_path)
-    return archive.get_first_file_matching(executable_path, reader,
-                                           upload_info.filename)
+    with archive.open(upload_info.filename, reader) as archive_reader:
+      # Fallback to executable file named 'run'.
+      if not executable_path:
+        executable_path = archive_reader.get_first_file_matching('run')
+
+      # Verify that there is a matching executable before updating the fuzzer.
+      if not executable_path or not archive_reader.file_exists(executable_path):
+        raise helpers.EarlyExitError(
+            'Failed to find an executable in the archive. Please specify an '
+            'executable path that matches a file in the archive.', 400)
+
+      return executable_path
 
   def _get_launcher_script(self, upload_info):
-    """Get launcher script path."""
+    """Get launcher script path.
+
+    Note: Launcher scripts are used to launch the target binary when executing
+    testcases (distinct from executable_path). Not used for blackbox fuzzing.
+    """
     launcher_script = request.get('launcher_script')
     if not upload_info:
       return launcher_script
@@ -113,11 +129,11 @@ class BaseEditHandler(base_handler.GcsUploadHandler):
       return launcher_script
 
     reader = self._read_to_bytesio(upload_info.gcs_path)
-    launcher_script = archive.get_first_file_matching(launcher_script, reader,
-                                                      upload_info.filename)
-    if not launcher_script:
-      raise helpers.EarlyExitException(
-          'Specified launcher script was not found in archive!', 400)
+    with archive.open(upload_info.filename, reader) as archive_reader:
+      launcher_script = archive_reader.get_first_file_matching(launcher_script)
+      if not launcher_script:
+        raise helpers.EarlyExitError(
+            'Specified launcher script was not found in archive!', 400)
 
     return launcher_script
 
@@ -130,19 +146,22 @@ class BaseEditHandler(base_handler.GcsUploadHandler):
     try:
       value = int(value)
     except (ValueError, TypeError):
-      raise helpers.EarlyExitException(
+      raise helpers.EarlyExitError(
           '{key} must be an integer.'.format(key=key), 400)
 
     if value <= 0:
-      raise helpers.EarlyExitException(
-          '{key} must be > 0.'.format(key=key), 400)
+      raise helpers.EarlyExitError('{key} must be > 0.'.format(key=key), 400)
 
     return value
+
+  def _get_fuzzer_state_str(self, fuzzer: data_types.Fuzzer) -> str:
+    fuzzer_dict = fuzzer.to_dict(exclude=FUZZER_FIELDS_EXCLUDED_FROM_LOG)
+    return '\n'.join(f"{key}: {val}" for key, val in fuzzer_dict.items())
 
   def apply_fuzzer_changes(self, fuzzer, upload_info):
     """Apply changes to a fuzzer."""
     if upload_info and not archive.is_archive(upload_info.filename):
-      raise helpers.EarlyExitException(
+      raise helpers.EarlyExitError(
           'Sorry, only zip, tgz, tar.gz, tbz, and tar.bz2 archives are '
           'allowed!', 400)
 
@@ -155,18 +174,22 @@ class BaseEditHandler(base_handler.GcsUploadHandler):
       # Executable path is required for non-builtin fuzzers and if it is not
       # already set.
       if not fuzzer.executable_path and not executable_path:
-        raise helpers.EarlyExitException(
+        raise helpers.EarlyExitError(
             'Please enter the path to the executable, or if the archive you '
             'uploaded is less than 16MB, ensure that the executable file has '
             '"run" in its name.', 400)
 
+    existing_fuzzer_info = self._get_fuzzer_state_str(fuzzer)
+
     jobs = request.get('jobs', [])
     timeout = self._get_integer_value('timeout')
     max_testcases = self._get_integer_value('max_testcases')
-    external_contribution = request.get('external_contribution', False)
-    differential = request.get('differential', False)
+    external_contribution = bool(request.get('external_contribution', False))
+    trusted = bool(request.get('trusted', False))
+    differential = bool(request.get('differential', False))
     environment_string = request.get('additional_environment_string')
     data_bundle_name = request.get('data_bundle_name')
+    primary_owner = request.get('primary_owner')
 
     # Save the fuzzer file metadata.
     if upload_info:
@@ -176,16 +199,19 @@ class BaseEditHandler(base_handler.GcsUploadHandler):
 
     fuzzer.jobs = jobs
     fuzzer.revision = fuzzer.revision + 1
-    fuzzer.source = helpers.get_user_email()
+    fuzzer.last_edited_by = helpers.get_user_email()
     fuzzer.timeout = timeout
     fuzzer.max_testcases = max_testcases
     fuzzer.result = None
     fuzzer.sample_testcase = None
     fuzzer.console_output = None
-    fuzzer.external_contribution = bool(external_contribution)
-    fuzzer.differential = bool(differential)
+    fuzzer.external_contribution = external_contribution
+    fuzzer.primary_owner = primary_owner
+    fuzzer.trusted = trusted
+    fuzzer.differential = differential
     fuzzer.additional_environment_string = environment_string
-    fuzzer.timestamp = datetime.datetime.utcnow()
+    fuzzer.timestamp = datetime.datetime.now(tz=datetime.timezone.utc).replace(
+        tzinfo=None)
     fuzzer.data_bundle_name = data_bundle_name
 
     # Update only if a new archive is provided.
@@ -197,11 +223,25 @@ class BaseEditHandler(base_handler.GcsUploadHandler):
     if launcher_script:
       fuzzer.launcher_script = launcher_script
 
+    if not fuzzer.trusted:
+      for job_name in jobs:
+        try:
+          data_handler.check_job_supports_untrusted_workloads(job_name)
+        except ValueError as e:
+          raise helpers.EarlyExitError(str(e), 400)
+
     fuzzer.put()
 
     fuzzer_selection.update_mappings_for_fuzzer(fuzzer)
 
-    helpers.log('Uploaded fuzzer %s.' % fuzzer.name, helpers.MODIFY_OPERATION)
+    new_fuzzer_info = self._get_fuzzer_state_str(fuzzer)
+    fuzzer_diff = helpers.diff(existing_fuzzer_info, new_fuzzer_info)
+    fuzzer_update_message = (f"\n--- Updated fuzzer {fuzzer.name} ---\n"
+                             f"{new_fuzzer_info}\n"
+                             f"--- Changes (Diff) ---\n"
+                             f"{fuzzer_diff}")
+    helpers.log(fuzzer_update_message, helpers.MODIFY_OPERATION)
+
     return self.redirect('/fuzzers')
 
 
@@ -215,25 +255,29 @@ class CreateHandler(BaseEditHandler):
     """Handle a post request."""
     name = request.get('name')
     if not name:
-      raise helpers.EarlyExitException('Please give the fuzzer a name!', 400)
+      raise helpers.EarlyExitError('Please give the fuzzer a name!', 400)
 
     if not data_types.Fuzzer.VALID_NAME_REGEX.match(name):
-      raise helpers.EarlyExitException(
+      raise helpers.EarlyExitError(
           'Fuzzer name can only contain letters, numbers, dashes and '
           'underscores.', 400)
 
     existing_fuzzer = data_types.Fuzzer.query(data_types.Fuzzer.name == name)
     if existing_fuzzer.get():
-      raise helpers.EarlyExitException(
+      raise helpers.EarlyExitError(
           'Fuzzer already exists. Please use the EDIT button for changes.', 400)
 
     upload_info = self.get_upload()
     if not upload_info:
-      raise helpers.EarlyExitException('Need to upload an archive.', 400)
+      raise helpers.EarlyExitError('Need to upload an archive.', 400)
 
     fuzzer = data_types.Fuzzer()
     fuzzer.name = name
     fuzzer.revision = 0
+    fuzzer.created_at = datetime.datetime.now(tz=datetime.timezone.utc).replace(
+        tzinfo=None)
+    fuzzer.source = helpers.get_user_email()
+
     return self.apply_fuzzer_changes(fuzzer, upload_info)
 
 
@@ -249,7 +293,7 @@ class EditHandler(BaseEditHandler):
 
     fuzzer = ndb.Key(data_types.Fuzzer, key).get()
     if not fuzzer:
-      raise helpers.EarlyExitException('Fuzzer not found.', 400)
+      raise helpers.EarlyExitError('Fuzzer not found.', 400)
 
     upload_info = self.get_upload()
     return self.apply_fuzzer_changes(fuzzer, upload_info)
@@ -267,7 +311,7 @@ class DeleteHandler(base_handler.Handler):
 
     fuzzer = ndb.Key(data_types.Fuzzer, key).get()
     if not fuzzer:
-      raise helpers.EarlyExitException('Fuzzer not found.', 400)
+      raise helpers.EarlyExitError('Fuzzer not found.', 400)
 
     fuzzer_selection.update_mappings_for_fuzzer(fuzzer, mappings=[])
     fuzzer.key.delete()
@@ -286,7 +330,7 @@ class LogHandler(base_handler.Handler):
     fuzzer = data_types.Fuzzer.query(
         data_types.Fuzzer.name == fuzzer_name).get()
     if not fuzzer:
-      raise helpers.EarlyExitException('Fuzzer not found.', 400)
+      raise helpers.EarlyExitError('Fuzzer not found.', 400)
 
     return self.render('viewer.html', {
         'title': 'Output for ' + fuzzer.name,

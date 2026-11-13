@@ -87,6 +87,16 @@ indexes:
   - name: entity_name
   - name: entity_kind
 
+- kind: FiledBug
+  properties:
+  - name: timestamp
+  - name: job_type
+
+- kind: FiledBug
+  properties:
+  - name: timestamp
+  - name: project_name
+
 - kind: FuzzTarget
   properties:
   - name: engine
@@ -96,6 +106,7 @@ indexes:
   properties:
   - name: engine
   - name: weight
+  - name: last_run
 
 - kind: ReportMetadata
   properties:
@@ -332,8 +343,10 @@ indexes:
   - name: project_name
   - name: platform
   - name: is_impact_set_flag
+  - name: impact_extended_stable_version
   - name: impact_stable_version
   - name: impact_beta_version
+  - name: impact_head_version
   - name: timestamp
 
 - kind: Testcase
@@ -348,6 +361,8 @@ indexes:
   - name: group_id
   - name: impact_beta_version
   - name: impact_stable_version
+  - name: impact_extended_stable_version
+  - name: impact_head_version
   - name: is_impact_set_flag
   - name: job_type
   - name: one_time_crasher_flag
@@ -442,6 +457,12 @@ indexes:
 
 - kind: Testcase
   properties:
+  - name: impact_extended_stable_version_indices
+  - name: timestamp
+    direction: desc
+
+- kind: Testcase
+  properties:
   - name: impact_stable_version_indices
   - name: timestamp
     direction: desc
@@ -506,6 +527,14 @@ indexes:
     - name: open
     - name: one_time_crasher_flag
 
+- kind: Testcase
+  properties:
+  - name: open
+  - name: status
+  - name: timestamp
+    direction: desc
+  - name: bug_information
+
 - kind: _AE_Pipeline_Record
   properties:
   - name: is_root_pipeline
@@ -560,3 +589,39 @@ indexes:
   properties:
     - name: keywords
     - name: bot_name
+
+- kind: WindowRateLimitTask
+  properties:
+    - name: job_name
+    - name: task_argument
+    - name: task_name
+    - name: timestamp
+
+- kind: Testcase
+  properties:
+  - name: one_time_crasher_flag
+  - name: open
+  - name: status
+  - name: fixed
+  - name: timestamp
+
+- kind: TestcaseLifecycleEvent
+  properties:
+  - name: testcase_id
+  - name: event_type
+  - name: task_name
+  - name: timestamp
+    direction: desc
+
+- kind: TestcaseLifecycleEvent
+  properties:
+  - name: testcase_id
+  - name: event_type
+  - name: timestamp
+    direction: desc
+
+- kind: TestcaseLifecycleEvent
+  properties:
+  - name: testcase_id
+  - name: timestamp
+    direction: desc

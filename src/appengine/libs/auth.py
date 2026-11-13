@@ -14,22 +14,27 @@
 """Authentication helpers."""
 
 import collections
-import jwt
 
 from firebase_admin import auth
+from google.auth.transport import requests as google_requests
 from google.cloud import ndb
-from googleapiclient.discovery import build
+from google.oauth2 import id_token
+from googleapiclient import discovery
+import jwt
 import requests
 
-from base import memoize
-from base import utils
-from config import local_config
-from datastore import data_types
+from clusterfuzz._internal.base import memoize
+from clusterfuzz._internal.base import utils
+from clusterfuzz._internal.config import local_config
+from clusterfuzz._internal.datastore import data_types
+from clusterfuzz._internal.metrics import logs
+from clusterfuzz._internal.system import environment
+from libs import helpers
 from libs import request_cache
-from metrics import logs
-from system import environment
 
-User = collections.namedtuple('User', ['email'])
+User = collections.namedtuple(
+    'User', ['email', 'email_verified'], defaults=(True,))
+BEARER_PREFIX = 'Bearer '
 
 
 class AuthError(Exception):
@@ -39,8 +44,17 @@ class AuthError(Exception):
 def auth_domain():
   """Get the auth domain."""
   domain = local_config.ProjectConfig().get('firebase.auth_domain')
-  if domain:
-    return domain
+  if not domain:
+    raise AuthError('No auth domain.')
+
+  return domain
+
+
+def real_auth_domain():
+  """Get the real auth domain"""
+  real_domain = local_config.ProjectConfig().get('firebase.real_auth_domain')
+  if real_domain:
+    return real_domain
 
   return utils.get_application_id() + '.firebaseapp.com'
 
@@ -51,7 +65,7 @@ def is_current_user_admin():
     return True
 
   user = get_current_user()
-  if not user:
+  if not user or not user.email_verified:
     return False
 
   key = ndb.Key(data_types.Admin, user.email)
@@ -61,7 +75,8 @@ def is_current_user_admin():
 @memoize.wrap(memoize.FifoInMemory(1))
 def _project_number_from_id(project_id):
   """Get the project number from project ID."""
-  resource_manager = build('cloudresourcemanager', 'v1')
+  resource_manager = discovery.build('cloudresourcemanager', 'v1')
+  # pylint: disable=no-member
   result = resource_manager.projects().get(projectId=project_id).execute()
   if 'projectNumber' not in result:
     raise AuthError('Failed to get project number.')
@@ -74,15 +89,16 @@ def _get_iap_key(key_id):
   """Retrieves a public key from the list published by Identity-Aware Proxy,
   re-fetching the key file if necessary.
   """
+  # pylint: disable=missing-timeout
   resp = requests.get('https://www.gstatic.com/iap/verify/public_key')
   if resp.status_code != 200:
-    raise AuthError('Unable to fetch IAP keys: {} / {} / {}'.format(
-        resp.status_code, resp.headers, resp.text))
+    raise AuthError('Unable to fetch IAP keys: '
+                    f'{resp.status_code} / {resp.headers} / {resp.text}')
 
   result = resp.json()
   key = result.get(key_id)
   if not key:
-    raise AuthError('Key {!r} not found'.format(key_id))
+    raise AuthError(f'Key {repr(key_id)} not found')
 
   return key
 
@@ -90,8 +106,8 @@ def _get_iap_key(key_id):
 def _validate_iap_jwt(iap_jwt):
   """Validate JWT assertion."""
   project_id = utils.get_application_id()
-  expected_audience = '/projects/{}/apps/{}'.format(
-      _project_number_from_id(project_id), project_id)
+  expected_audience = f'/projects/{_project_number_from_id(project_id)}' \
+                      f'/apps/{project_id}'
 
   try:
     key_id = jwt.get_unverified_header(iap_jwt).get('kid')
@@ -120,6 +136,26 @@ def get_iap_email(current_request):
   return _validate_iap_jwt(jwt_assertion)
 
 
+def get_email_from_bearer_token(request):
+  """Gets the email corresponding to a bearer token in an http request."""
+  bearer_token = request.headers.get('Authorization', '')
+  if not bearer_token.startswith(BEARER_PREFIX):
+    raise helpers.UnauthorizedError('Missing or invalid bearer token.')
+
+  token = bearer_token.split(' ')[1]
+  try:
+    claim = id_token.verify_oauth2_token(token, google_requests.Request())
+  except ValueError:
+    raise helpers.UnauthorizedError('Malformed bearer token')
+  if (not claim.get('email_verified') or
+      claim.get('email') != utils.service_account_email()):
+    raise helpers.UnauthorizedError('Invalid ID token.')
+
+  if not claim.get('email_verified'):
+    return None
+  return claim.get('email')
+
+
 def get_current_user():
   """Get the current logged in user, or None."""
   if environment.is_local_development():
@@ -135,6 +171,14 @@ def get_current_user():
   if iap_email:
     return User(iap_email)
 
+  try:
+    bearer_token_email = get_email_from_bearer_token(current_request)
+    if bearer_token_email:
+      logs.info(f'bearer token email = {bearer_token_email}')
+      return User(bearer_token_email)
+  except helpers.UnauthorizedError as e:
+    logs.warning(f'Exception while trying to get email from auth token: {e}')
+
   cache_backing = request_cache.get_cache_backing()
   oauth_email = getattr(cache_backing, '_oauth_email', None)
   if oauth_email:
@@ -142,7 +186,8 @@ def get_current_user():
 
   cached_email = getattr(cache_backing, '_cached_email', None)
   if cached_email:
-    return User(cached_email)
+    return User(cached_email,
+                getattr(cache_backing, '_cached_email_verified', True))
 
   session_cookie = get_session_cookie()
   if not session_cookie:
@@ -151,26 +196,50 @@ def get_current_user():
   try:
     decoded_claims = decode_claims(get_session_cookie())
   except AuthError:
-    logs.log_warn('Invalid session cookie.')
+    logs.warning('Invalid session cookie.')
     return None
 
-  if not decoded_claims.get('email_verified'):
+  allowed_firebase_providers = local_config.ProjectConfig().get(
+      'firebase.auth_providers', ['google.com'])
+  firebase_info = decoded_claims.get('firebase', {})
+  sign_in_provider = firebase_info.get('sign_in_provider')
+
+  if sign_in_provider not in allowed_firebase_providers:
+    logs.error(f'Firebase provider {sign_in_provider} is not enabled.')
     return None
 
+  email_verified = bool(decoded_claims.get('email_verified'))
   email = decoded_claims.get('email')
+  if not email_verified:
+    # The user is rejected here rather than by an access check, and the login
+    # page is expected to have asked them to verify their email.
+    logs.warning(f'Rejecting sign-in from provider {sign_in_provider}: '
+                 f'email {email} is not verified.')
+    return None
+
   if not email:
+    return None
+
+  # Service accounts are expected to authenticate through IAP or a bearer
+  # token, both handled above. They cannot obtain a Firebase session cookie
+  # today, so this is defense-in-depth against a future flow that mints custom
+  # tokens for them.
+  if utils.is_service_account(email):
+    logs.warning(
+        f'Rejecting Firebase session cookie for service account {email}.')
     return None
 
   # We cache the email for this request if we've validated the user to make
   # subsequent get_current_user() calls fast.
   setattr(cache_backing, '_cached_email', email)
-  return User(email)
+  setattr(cache_backing, '_cached_email_verified', email_verified)
+  return User(email, email_verified)
 
 
-def create_session_cookie(id_token, expires_in):
+def create_session_cookie(token, expires_in):
   """Create a new session cookie."""
   try:
-    return auth.create_session_cookie(id_token, expires_in=expires_in)
+    return auth.create_session_cookie(token, expires_in=expires_in)
   except auth.AuthError:
     raise AuthError('Failed to create session cookie.')
 

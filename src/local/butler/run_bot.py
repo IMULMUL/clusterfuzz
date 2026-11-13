@@ -41,11 +41,11 @@ def _setup_bot_directory(args):
       os.path.join(src_root_dir, 'src', 'appengine'),
       os.path.join(bot_src_dir, 'appengine'))
   common.update_dir(
-      os.path.join(src_root_dir, 'src', 'protos'),
-      os.path.join(bot_src_dir, 'protos'))
-  common.update_dir(
       os.path.join(src_root_dir, 'src', 'python'),
       os.path.join(bot_src_dir, 'python'))
+  common.update_dir(
+      os.path.join(src_root_dir, 'src', 'clusterfuzz'),
+      os.path.join(bot_src_dir, 'clusterfuzz'))
   common.update_dir(
       os.path.join(src_root_dir, 'src', 'third_party'),
       os.path.join(bot_src_dir, 'third_party'))
@@ -73,8 +73,8 @@ def _setup_environment_and_configs(args, appengine_path):
     os.environ['BOT_NAME'] = args.name
 
   os.environ['LD_LIBRARY_PATH'] = '{0}:{1}'.format(
-      os.path.join(clusterfuzz_dir, 'src', 'python', 'scripts'),
-      os.getenv('LD_LIBRARY_PATH', ''))
+      os.path.join(clusterfuzz_dir, 'src', 'clusterfuzz', '_internal',
+                   'scripts'), os.getenv('LD_LIBRARY_PATH', ''))
 
   tmpdir = os.path.join(clusterfuzz_dir, 'bot_tmpdir')
   if not os.path.exists(tmpdir):
@@ -98,7 +98,9 @@ def _setup_environment_and_configs(args, appengine_path):
     os.environ['LOCAL_GCS_BUCKETS_PATH'] = local_gcs_buckets_path
 
   if args.android_serial:
-    os.environ['OS_OVERRIDE'] = 'ANDROID'
+    if not os.getenv('OS_OVERRIDE'):
+      os.environ['OS_OVERRIDE'] = 'ANDROID'
+
     os.environ['ANDROID_SERIAL'] = args.android_serial
 
 
@@ -109,6 +111,7 @@ def execute(args):
   _setup_bot_directory(args)
   _setup_environment_and_configs(args, appengine_path)
 
+  exit_code = 0
   try:
     os.chdir(os.path.join(args.directory, 'clusterfuzz'))
     proc = common.execute_async('python src/python/bot/startup/run_bot.py')
@@ -119,6 +122,8 @@ def execute(args):
 
     signal.signal(signal.SIGTERM, _stop_handler)
     common.process_proc_output(proc)
-    proc.wait()
+    exit_code = proc.wait()
   except KeyboardInterrupt:
     _stop_handler()
+    # exit_code should be 0 when Ctrl-Ced.
+  return exit_code

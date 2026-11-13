@@ -14,7 +14,7 @@
 FROM gcr.io/clusterfuzz-images/base
 
 ENV RUN_CMD \
-   "python3.7 $ROOT_DIR/src/python/scripts/other-bots/chromium-builder/run.py"
+   "python3.11 $ROOT_DIR/src/python/other-bots/chromium-builder/run.py"
 ENV BUCKET_PREFIX "chromium-browser-"
 ENV BUILD_DIR /home/$USER/builds
 ENV DISABLE_MOUNTS True
@@ -32,16 +32,13 @@ RUN apt-get update && \
         subversion \
         zip
 
-# Install Chromium build dependencies.
+# Put in the build context by build.sh, so the request can be authenticated.
+COPY install-build-deps.py /tmp/install-build-deps.py
+# Note: snapcraft installation seems to always fail.
 RUN echo ttf-mscorefonts-installer msttcorefonts/accepted-mscorefonts-eula select true | debconf-set-selections && \
-    curl 'https://chromium.googlesource.com/chromium/src/+/master/build/install-build-deps.sh?format=TEXT' | base64 -d > /tmp/install-build-deps.sh && \
-    chmod u+x /tmp/install-build-deps.sh && \
-    /tmp/install-build-deps.sh --backwards-compatible --no-prompt --no-chromeos-fonts --syms
-
-# 16.04's pyOpenSSL (installed by install-build-deps.sh) is too old for
-# Google Cloud SDK.
-RUN sudo apt-get remove -y python-openssl && \
-    sudo pip2 install cryptography==3.3.2 pyOpenSSL==19.0.0
+    sed -i s/snapcraft/doesnotexist/ /tmp/install-build-deps.py && \
+    chmod u+x /tmp/install-build-deps.py && \
+    /tmp/install-build-deps.py --backwards-compatible --no-prompt --no-chromeos-fonts --syms
 
 RUN git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git \
     /data/depot_tools
@@ -50,4 +47,9 @@ RUN git clone https://gerrit.googlesource.com/gcompute-tools \
     /data/gcompute-tools
 
 COPY start.sh setup_depot_tools.sh setup_gerrit.sh /data/
+
+# Fix PATH to prefer /usr/local/bin to avoid build failures with using older
+# Python 3 in /usr/bin.
+ENV PATH /usr/local/bin:$PATH
+RUN ln -s /usr/local/bin/python3.11 /usr/local/bin/python3
 CMD ["bash", "-ex", "/data/start.sh"]

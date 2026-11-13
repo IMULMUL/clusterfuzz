@@ -17,9 +17,6 @@
 # Process command line arguments.
 while [ "$1" != "" ]; do
   case $1 in
-    --only-reproduce)
-      only_reproduce=1
-      ;;
     --install-android-emulator)
       install_android_emulator=1
       ;;
@@ -28,7 +25,17 @@ while [ "$1" != "" ]; do
 done
 
 if [ -z "$PYTHON" ]; then
-  PYTHON='python3'
+  if which python3.11 > /dev/null; then
+    export PYTHON='python3.11'
+  elif which python3.10 > /dev/null; then
+    export PYTHON='python3.10'
+  elif which python3.9 > /dev/null; then
+    export PYTHON='python3.9'
+  elif which python3.8 > /dev/null; then
+    export PYTHON='python3.8'
+  else
+    export PYTHON='python3'
+  fi
 fi
 
 if ! which "$PYTHON" > /dev/null; then
@@ -37,10 +44,6 @@ if ! which "$PYTHON" > /dev/null; then
 fi
 
 version=$($PYTHON --version 2>&1 | cut -f2 -d' ')
-if [[ "$version" < "3.7" ]]; then
-  echo "You need at least Python 3.7"
-  exit 1
-fi
 
 # Check for lsb_release command in $PATH.
 if ! which lsb_release > /dev/null; then
@@ -51,7 +54,7 @@ fi
 # Check if the distro is supported.
 distro_codename=$(lsb_release --codename --short)
 distro_id=$(lsb_release --id --short)
-supported_codenames="(xenial|artful|bionic|cosmic|focal)"
+supported_codenames="(xenial|artful|bionic|cosmic|focal|noble)"
 supported_ids="(Debian)"
 if [[ ! $distro_codename =~ $supported_codenames &&
       ! $distro_id =~ $supported_ids ]]; then
@@ -77,56 +80,61 @@ sudo apt-get install -y \
     blackbox \
     curl \
     libpython3-all-dev \
+    pipenv \
+    python3-dev \
     python3-pip \
     unzip \
     xvfb
 
-if [ ! $only_reproduce ]; then
-  # Prerequisite for add-apt-repository.
-  sudo apt-get install -y apt-transport-https software-properties-common
+# Prerequisite for add-apt-repository.
+sudo apt-get install -y apt-transport-https software-properties-common
 
-  if [ "$distro_codename" == "rodete" ]; then
+if [ "$distro_codename" == "rodete" ]; then
+  if ! which docker > /dev/null 2>&1; then
     glogin
     sudo glinux-add-repo docker-ce-"$distro_codename"
-  else
-    curl -fsSL https://download.docker.com/linux/${distro_id,,}/gpg | \
-        sudo apt-key add -
-    sudo add-apt-repository -y \
-        "deb [arch=amd64] https://download.docker.com/linux/${distro_id,,} \
-        $distro_codename \
-        stable"
-
-    export CLOUD_SDK_REPO="cloud-sdk"
-    echo "deb http://packages.cloud.google.com/apt $CLOUD_SDK_REPO main" | \
-        sudo tee -a /etc/apt/sources.list.d/google-cloud-sdk.list
-    curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | \
-        sudo apt-key add -
   fi
+else
+  curl -fsSL https://download.docker.com/linux/${distro_id,,}/gpg | \
+      sudo apt-key add -
+  sudo add-apt-repository -y \
+      "deb [arch=amd64] https://download.docker.com/linux/${distro_id,,} \
+      $distro_codename \
+      stable"
 
-  # Install apt-get packages.
-  sudo apt-get update
-  sudo apt-get install -y \
-      docker-ce \
-      google-cloud-sdk \
-      openjdk-8-jdk \
-      liblzma-dev
+  export CLOUD_SDK_REPO="cloud-sdk"
+  export APT_FILE=/etc/apt/sources.list.d/google-cloud-sdk.list
+  export APT_LINE="deb [signed-by=/usr/share/keyrings/cloud.google.asc] https://packages.cloud.google.com/apt $CLOUD_SDK_REPO main"
+  sudo bash -c "grep -Fx \"$APT_LINE\" $APT_FILE || (echo \"$APT_LINE\" | tee $APT_FILE)"
 
-  # Install patchelf - latest version not available on some older distros so we
-  # compile from source.
-  # Needed for MemorySanitizer to patch instrumented system libraries into the
-  # target binary (using RPATH).
-  unsupported_codenames="(xenial|jessie)"
-  if [[ $distro_codename =~ $unsupported_codenames ]]; then
-      (cd /tmp && \
-          curl -sS https://releases.nixos.org/patchelf/patchelf-0.9/patchelf-0.9.tar.bz2 \
-          | tar -C /tmp -xj && \
-          cd /tmp/patchelf-*/ && \
-          ./configure && \
-          sudo make install && \
-          sudo rm -rf /tmp/patchelf-*)
-  else
-      sudo apt-get install -y patchelf
-  fi
+  curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | \
+      sudo tee /usr/share/keyrings/cloud.google.asc >/dev/null
+
+fi
+
+# Install apt-get packages.
+sudo apt-get update
+sudo apt-get install -y \
+    docker-ce \
+    google-cloud-cli \
+    openjdk-17-jdk \
+    liblzma-dev
+
+# Install patchelf - latest version not available on some older distros so we
+# compile from source.
+# Needed for MemorySanitizer to patch instrumented system libraries into the
+# target binary (using RPATH).
+unsupported_codenames="(xenial|jessie)"
+if [[ $distro_codename =~ $unsupported_codenames ]]; then
+    (cd /tmp && \
+        curl -sS https://releases.nixos.org/patchelf/patchelf-0.9/patchelf-0.9.tar.bz2 \
+        | tar -C /tmp -xj && \
+        cd /tmp/patchelf-*/ && \
+        ./configure && \
+        sudo make install && \
+        sudo rm -rf /tmp/patchelf-*)
+else
+    sudo apt-get install -y patchelf
 fi
 
 # Install gcloud dependencies.
@@ -139,62 +147,25 @@ if gcloud components install --quiet beta; then
       cloud-datastore-emulator \
       pubsub-emulator
 else
-  # Either Cloud SDK component manager is disabled (default on GCE), or google-cloud-sdk package is
+  # Either Cloud SDK component manager is disabled (default on GCE), or google-cloud-cli package is
   # installed via apt-get.
-  sudo apt-get install -y \
-      google-cloud-sdk-app-engine-go \
-      google-cloud-sdk-app-engine-python \
-      google-cloud-sdk-app-engine-python-extras \
-      google-cloud-sdk \
-      google-cloud-sdk-datastore-emulator \
-      google-cloud-sdk-pubsub-emulator
+  # Note: app-engine-python, app-engine-python-extras, and pubsub-emulator apt packages are optional on rodete (b/414408644, b/484368884).
+  if [ "$distro_codename" == "rodete" ]; then
+    sudo apt-get install -y \
+        google-cloud-cli \
+        google-cloud-cli-datastore-emulator
+  else
+    # Pinning the latest version that works with Java 17, as
+    # google-cloud-cli-datastore-emulator >= 592.0.0 requires Java 25.
+    sudo apt-get install -y \
+        google-cloud-cli \
+        google-cloud-cli-app-engine-go \
+        google-cloud-cli-app-engine-python \
+        google-cloud-cli-app-engine-python-extras \
+        google-cloud-cli-datastore-emulator=591.0.0-0 \
+        google-cloud-cli-pubsub-emulator
+  fi
 fi
 
-# Setup pipenv and install python dependencies.
-$PYTHON -m pip install --user pipenv
-$PYTHON -m pipenv --python $PYTHON
-$PYTHON -m pipenv sync --dev
-source "$(${PYTHON} -m pipenv --venv)/bin/activate"
-
-if [ $install_android_emulator ]; then
-  ANDROID_SDK_INSTALL_DIR=local/bin/android-sdk
-  ANDROID_SDK_REVISION=4333796
-  ANDROID_VERSION=28
-  ANDROID_TOOLS_BIN=$ANDROID_SDK_INSTALL_DIR/tools/bin/
-
-  # Install the Android emulator and its dependencies. Used in tests and as an
-  # option during Android test case reproduction.
-  rm -rf $ANDROID_SDK_INSTALL_DIR
-  mkdir $ANDROID_SDK_INSTALL_DIR
-  curl https://dl.google.com/android/repository/sdk-tools-linux-$ANDROID_SDK_REVISION.zip \
-      --output $ANDROID_SDK_INSTALL_DIR/sdk-tools-linux.zip
-  unzip -d $ANDROID_SDK_INSTALL_DIR $ANDROID_SDK_INSTALL_DIR/sdk-tools-linux.zip
-
-  $ANDROID_TOOLS_BIN/sdkmanager "emulator"
-  $ANDROID_TOOLS_BIN/sdkmanager "platform-tools" "platforms;android-$ANDROID_VERSION"
-  $ANDROID_TOOLS_BIN/sdkmanager "system-images;android-$ANDROID_VERSION;google_apis;x86"
-  $ANDROID_TOOLS_BIN/sdkmanager --licenses
-  $ANDROID_TOOLS_BIN/avdmanager create avd --force -n TestImage -k "system-images;android-$ANDROID_VERSION;google_apis;x86"
-fi
-
-if [ ! $only_reproduce ]; then
-  # Install other dependencies (e.g. bower).
-  nodeenv -p --prebuilt
-  # Unsafe perm flag allows bower and polymer-bundler install for root users as well.
-  npm install --unsafe-perm -g bower polymer-bundler
-  bower --allow-root install
-
-  # Run the full bootstrap script to prepare for ClusterFuzz development.
-  python butler.py bootstrap
-else
-  # The reproduce tool only needs a limited bootstrap.
-  python butler.py bootstrap --only-reproduce
-fi
-
-set +x
-echo "
-
-Installation succeeded!
-Please load environment by running "$PYTHON -m pipenv shell".
-
-"
+dir=$(dirname "$0")
+"$dir"/install_python_deps_linux.bash $*

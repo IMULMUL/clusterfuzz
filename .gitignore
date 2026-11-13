@@ -17,13 +17,16 @@
 .idea
 /.project
 /.pydevproject
+/.python-version
 /ENV
 /bot/*
 /coverage
 /deployment
+/clusterfuzz-config
 /local/bin/android-sdk/*
 /local/storage
 /paramiko.log
+/src/appengine/requirements.txt
 /src/appengine/app.yaml
 /src/appengine/cron-service.yaml
 /src/appengine/cron.yaml
@@ -31,8 +34,7 @@
 /src/appengine/config
 /src/appengine/local_gcs
 /src/appengine/private/bower_components
-/src/appengine/protos
-/src/appengine/python
+/src/appengine/clusterfuzz
 /src/appengine/resources/clusterfuzz-source.manifest
 /src/appengine/templates
 /src/appengine/third_party
@@ -41,5 +43,29 @@
 /src/local/remote/generated.remmina
 /src/protos/ENV
 /src/third_party
+/src/requirements.txt
 _test_data
 bazel-*
+/src/dist
+/src/build
+*.egg-info
+/src/clusterfuzz/lib-config
+.DS_Store
+.vscode
+*.tfstate*
+*.lock.hcl
+**/.terraform/*
+
+# Ignore temporary build files.
+docker/base/Pipfile
+docker/base/Pipfile.lock
+docker/chromium/base/install-build-deps.py
+docker/chromium/builder/install-build-deps.py
+
+# Tags and Cscope files
+tags
+cscope.files
+cscope.out
+
+# Test coverage files
+.coverage

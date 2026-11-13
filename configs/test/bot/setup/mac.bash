@@ -23,7 +23,6 @@ if [ -z "$GOOGLE_APPLICATION_CREDENTIALS" ]; then
   exit 1
 fi
 
-NFS_ROOT=  # Fill in NFS information if available.
 GOOGLE_CLOUD_SDK=google-cloud-sdk
 GOOGLE_CLOUD_SDK_ARCHIVE=google-cloud-sdk-232.0.0-darwin-x86_64.tar.gz
 INSTALL_DIRECTORY=${INSTALL_DIRECTORY:-${HOME}}
@@ -66,17 +65,23 @@ echo "Specifying the proper Boto configuration file."
 # Otherwise, gsutil will error out due to multiple types of configured
 # credentials. For more information about this, see
 # https://cloud.google.com/storage/docs/gsutil/commands/config#configuration-file-selection-procedure
-BOTO_CONFIG_PATH=$($GSUTIL_PATH/gsutil -D 2>&1 | grep "config_file_list" | egrep -o "/[^']+gserviceaccount\.com/\.boto")
-
-if [ -f $BOTO_CONFIG_PATH ]; then
-  export BOTO_CONFIG="$BOTO_CONFIG_PATH"
-else
-  echo "WARNING: failed to identify the Boto configuration file and specify BOTO_CONFIG env."
-fi
-
 echo "Downloading ClusterFuzz source code."
 rm -rf clusterfuzz
-$GSUTIL_PATH/gsutil cp gs://$DEPLOYMENT_BUCKET/$DEPLOYMENT_ZIP clusterfuzz-source.zip
+if [ "$USE_GCLOUD_STORAGE_CP" = "1" ]; then
+  echo "Downloading ClusterFuzz source code using gcloud."
+  $GSUTIL_PATH/gcloud storage cp gs://$DEPLOYMENT_BUCKET/$DEPLOYMENT_ZIP clusterfuzz-source.zip
+else
+  BOTO_CONFIG_PATH=$($GSUTIL_PATH/gsutil -D 2>&1 | grep "config_file_list" | egrep -o "/[^']+gserviceaccount\.com/\.boto")
+
+  if [ -f $BOTO_CONFIG_PATH ]; then
+    export BOTO_CONFIG="$BOTO_CONFIG_PATH"
+  else
+    echo "WARNING: failed to identify the Boto configuration file and specify BOTO_CONFIG env."
+  fi
+
+  echo "Downloading ClusterFuzz source code using gsutil."
+  $GSUTIL_PATH/gsutil cp gs://$DEPLOYMENT_BUCKET/$DEPLOYMENT_ZIP clusterfuzz-source.zip
+fi
 unzip -q clusterfuzz-source.zip
 
 echo "Installing ClusterFuzz package dependencies using pipenv."
@@ -86,11 +91,11 @@ if ! python3 -m pip > /dev/null ; then
   python3 get-pip.py
 fi
 python3 -m pip install --upgrade pipenv
-pipenv --python 3.7
+pipenv --python 3.11
 pipenv sync
 source "$(pipenv --venv)/bin/activate"
 
 echo "Running ClusterFuzz."
-NFS_ROOT="$NFS_ROOT" GOOGLE_APPLICATION_CREDENTIALS="$GOOGLE_APPLICATION_CREDENTIALS" ROOT_DIR="$ROOT_DIR" PYTHONPATH="$PYTHONPATH" GSUTIL_PATH="$GSUTIL_PATH" python $ROOT_DIR/src/python/bot/startup/run.py &
+GOOGLE_APPLICATION_CREDENTIALS="$GOOGLE_APPLICATION_CREDENTIALS" ROOT_DIR="$ROOT_DIR" PYTHONPATH="$PYTHONPATH" GSUTIL_PATH="$GSUTIL_PATH" python $ROOT_DIR/src/python/bot/startup/run.py &
 
 echo "Success!"

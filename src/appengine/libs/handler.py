@@ -17,25 +17,25 @@ import datetime
 import functools
 import json
 import re
-import requests
 
 from flask import g
 from flask import make_response
 from flask import request
-from google.auth.transport import requests as google_requests
-from google.oauth2 import id_token
 import google.auth
+import requests
 
-from base import utils
-from config import db_config
-from config import local_config
-from datastore import data_types
-from google_cloud_utils import pubsub
+from clusterfuzz._internal.base import utils
+from clusterfuzz._internal.config import local_config
+from clusterfuzz._internal.datastore import data_types
+from clusterfuzz._internal.google_cloud_utils import pubsub
+from clusterfuzz._internal.metrics import monitor
+from clusterfuzz._internal.system import environment
 from libs import access
 from libs import auth
 from libs import csp
 from libs import helpers
-from system import environment
+
+HTTP_GET_TIMEOUT_SECS = 30
 
 JSON = 'json'
 FORM = 'form'
@@ -44,7 +44,6 @@ TEXT = 'text'
 
 CLUSTERFUZZ_AUTHORIZATION_HEADER = 'x-clusterfuzz-authorization'
 CLUSTERFUZZ_AUTHORIZATION_IDENTITY = 'x-clusterfuzz-identity'
-VERIFICATION_CODE_PREFIX = 'VerificationCode '
 BEARER_PREFIX = 'Bearer '
 
 _auth_config_obj = None
@@ -63,8 +62,7 @@ def extend_request(req, params):
   """Extends a request."""
 
   def _iterparams():
-    for k, v in params.items():
-      yield k, v
+    yield from params.items()
 
   def _get(key, default_value=None):
     """Return the value of the key or the default value."""
@@ -79,7 +77,7 @@ def extend_json_request(req):
   try:
     params = json.loads(req.data)
   except ValueError as e:
-    raise helpers.EarlyExitException(
+    raise helpers.EarlyExitError(
         'Parsing the JSON request body failed: %s' % req.data, 400) from e
 
   extend_request(req, params)
@@ -95,13 +93,17 @@ def cron():
     def wrapper(self):
       """Wrapper."""
       if not self.is_cron():
-        raise helpers.AccessDeniedException('You are not a cron.')
+        raise helpers.AccessDeniedError('You are not a cron.')
 
-      result = func(self)
-      if result is None:
-        return 'OK'
+      # Add env vars used by logs context for cleanup/triage.
+      environment.set_task_id_vars(self.__module__)
 
-      return result
+      with monitor.wrap_with_monitoring():
+        result = func(self)
+        if result is None:
+          return 'OK'
+
+        return result
 
     return wrapper
 
@@ -118,7 +120,7 @@ def check_admin_access(func):
   def wrapper(self):
     """Wrapper."""
     if not auth.is_current_user_admin():
-      raise helpers.AccessDeniedException('Admin access is required.')
+      raise helpers.AccessDeniedError('Admin access is required.')
 
     return func(self)
 
@@ -153,7 +155,7 @@ def unsupported_on_local_server(func):
   def wrapper(self, *args, **kwargs):
     """Wrapper."""
     if environment.is_running_on_app_engine_development():
-      raise helpers.EarlyExitException(
+      raise helpers.EarlyExitError(
           'This feature is not available in local App Engine Development '
           'environment.', 400)
 
@@ -162,40 +164,46 @@ def unsupported_on_local_server(func):
   return wrapper
 
 
-def get_access_token(verification_code):
-  """Get the access token from verification code.
+def validate_id_token(access_token):
+  """Validates a JWT as an id token."""
+  response_id_token = requests.get(
+      'https://www.googleapis.com/oauth2/v3/tokeninfo',
+      params={'id_token': access_token},
+      timeout=HTTP_GET_TIMEOUT_SECS)
 
-    See: https://developers.google.com/identity/protocols/OAuth2InstalledApp
-  """
-  client_id = db_config.get_value('reproduce_tool_client_id')
-  if not client_id:
-    raise helpers.UnauthorizedException('Client id not configured.')
+  if response_id_token.status_code == 200:
+    return response_id_token
 
-  client_secret = db_config.get_value('reproduce_tool_client_secret')
-  if not client_secret:
-    raise helpers.UnauthorizedException('Client secret not configured.')
+  return None
 
-  response = requests.post(
-      'https://www.googleapis.com/oauth2/v4/token',
-      headers={'Content-Type': 'application/x-www-form-urlencoded'},
-      data={
-          'code': verification_code,
-          'client_id': client_id,
-          'client_secret': client_secret,
-          'redirect_uri': 'urn:ietf:wg:oauth:2.0:oob',
-          'grant_type': 'authorization_code'
-      })
 
-  if response.status_code != 200:
-    raise helpers.UnauthorizedException('Invalid verification code (%s): %s' %
-                                        (verification_code, response.text))
+def validate_access_token(access_token):
+  """Validates a JWT as an access token."""
+  response_access_token = requests.get(
+      'https://www.googleapis.com/oauth2/v3/tokeninfo',
+      params={'access_token': access_token},
+      timeout=HTTP_GET_TIMEOUT_SECS)
 
-  try:
-    data = json.loads(response.text)
-    return data['access_token']
-  except (KeyError, ValueError) as e:
-    raise helpers.EarlyExitException(
-        'Parsing the JSON response body failed: %s' % response.text, 500) from e
+  if response_access_token.status_code == 200:
+    return response_access_token
+
+  return None
+
+
+def validate_token(authorization):
+  """Validates a JWT as either an access or id token, or raises."""
+  access_token = authorization.split(' ')[1]
+  id_token_response = validate_id_token(access_token)
+  if id_token_response is not None:
+    return id_token_response
+
+  access_token_response = validate_access_token(access_token)
+  if access_token_response is not None:
+    return access_token_response
+
+  raise helpers.UnauthorizedError(
+      f'Failed to authorize. The Authorization header ({authorization}) '
+      'is neither a valid id or access token.')
 
 
 def get_email_and_access_token(authorization):
@@ -203,25 +211,12 @@ def get_email_and_access_token(authorization):
 
     See: https://developers.google.com/identity/protocols/OAuth2InstalledApp
   """
-  if authorization.startswith(VERIFICATION_CODE_PREFIX):
-    verification_code = authorization.split(' ')[1]
-    access_token = get_access_token(verification_code)
-    authorization = BEARER_PREFIX + access_token
-
   if not authorization.startswith(BEARER_PREFIX):
-    raise helpers.UnauthorizedException(
+    raise helpers.UnauthorizedError(
         'The Authorization header is invalid. It should have been started with'
         " '%s'." % BEARER_PREFIX)
 
-  access_token = authorization.split(' ')[1]
-
-  response = requests.get(
-      'https://www.googleapis.com/oauth2/v3/tokeninfo',
-      params={'access_token': access_token})
-  if response.status_code != 200:
-    raise helpers.UnauthorizedException(
-        'Failed to authorize. The Authorization header (%s) might be invalid.' %
-        authorization)
+  response = validate_token(authorization)
 
   try:
     data = json.loads(response.text)
@@ -232,25 +227,21 @@ def get_email_and_access_token(authorization):
         'whitelisted_oauth_emails', default=[]):
       return data['email'], authorization
 
-    # Validate that this is an explicitly whitelisted client ID, or the client
-    # ID for the reproduce tool.
+    # Validate that this is an explicitly whitelisted client ID.
     whitelisted_client_ids = _auth_config().get(
         'whitelisted_oauth_client_ids', default=[])
-    reproduce_tool_client_id = db_config.get_value('reproduce_tool_client_id')
-    if reproduce_tool_client_id:
-      whitelisted_client_ids += [reproduce_tool_client_id]
     if data.get('aud') not in whitelisted_client_ids:
-      raise helpers.UnauthorizedException(
+      raise helpers.UnauthorizedError(
           "The access token doesn't belong to one of the allowed OAuth clients"
           ': %s.' % response.text)
 
     if not data.get('email_verified'):
-      raise helpers.UnauthorizedException('The email (%s) is not verified: %s.'
-                                          % (data.get('email'), response.text))
+      raise helpers.UnauthorizedError('The email (%s) is not verified: %s.' %
+                                      (data.get('email'), response.text))
 
     return data['email'], authorization
   except (KeyError, ValueError) as e:
-    raise helpers.EarlyExitException(
+    raise helpers.EarlyExitError(
         'Parsing the JSON response body failed: %s' % response.text, 500) from e
 
 
@@ -260,20 +251,20 @@ def oauth(func):
   """
 
   @functools.wraps(func)
-  def wrapper(self):
+  def wrapper(self, *args, **kwargs):
     """Wrapper."""
     auth_header = request.headers.get('Authorization')
     if auth_header:
       email, returned_auth_header = get_email_and_access_token(auth_header)
       setattr(g, '_oauth_email', email)
 
-      response = make_response(func(self))
+      response = make_response(func(self, *args, **kwargs))
       response.headers[CLUSTERFUZZ_AUTHORIZATION_HEADER] = str(
           returned_auth_header)
       response.headers[CLUSTERFUZZ_AUTHORIZATION_IDENTITY] = str(email)
       return response
 
-    return func(self)
+    return func(self, *args, **kwargs)
 
   return wrapper
 
@@ -285,18 +276,12 @@ def pubsub_push(func):
   def wrapper(self):
     """Wrapper."""
     try:
-      bearer_token = request.headers.get('Authorization', '')
-      if not bearer_token.startswith(BEARER_PREFIX):
-        raise helpers.UnauthorizedException('Missing or invalid bearer token.')
-
-      token = bearer_token.split(' ')[1]
-      claim = id_token.verify_oauth2_token(token, google_requests.Request())
+      email = auth.get_email_from_bearer_token(request)
     except google.auth.exceptions.GoogleAuthError as e:
-      raise helpers.UnauthorizedException('Invalid ID token.') from e
+      raise helpers.UnauthorizedError('Invalid ID token.') from e
 
-    if (not claim.get('email_verified') or
-        claim.get('email') != utils.service_account_email()):
-      raise helpers.UnauthorizedException('Invalid ID token.')
+    if (not email or email != utils.service_account_email()):
+      raise helpers.UnauthorizedError('Invalid ID token.')
 
     message = pubsub.raw_message_to_message(json.loads(request.data.decode()))
     return func(self, message)
@@ -317,7 +302,7 @@ def check_user_access(need_privileged_access):
     def wrapper(self, *args, **kwargs):
       """Wrapper."""
       if not access.has_access(need_privileged_access=need_privileged_access):
-        raise helpers.AccessDeniedException()
+        raise helpers.AccessDeniedError()
 
       return func(self, *args, **kwargs)
 
@@ -451,19 +436,19 @@ def require_csrf_token(func):
     token_value = request.get('csrf_token')
     user = auth.get_current_user()
     if not user:
-      raise helpers.AccessDeniedException('Not logged in.')
+      raise helpers.AccessDeniedError('Not logged in.')
 
     query = data_types.CSRFToken.query(
         data_types.CSRFToken.value == token_value,
         data_types.CSRFToken.user_email == user.email)
     token = query.get()
     if not token:
-      raise helpers.AccessDeniedException('Invalid CSRF token.')
+      raise helpers.AccessDeniedError('Invalid CSRF token.')
 
     # Make sure that the token is not expired.
     if token.expiration_time < datetime.datetime.utcnow():
       token.key.delete()
-      raise helpers.AccessDeniedException('Expired CSRF token.')
+      raise helpers.AccessDeniedError('Expired CSRF token.')
 
     return func(self, *args, **kwargs)
 

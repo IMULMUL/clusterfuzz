@@ -15,11 +15,11 @@
 
 from flask import request
 
-from base import errors
-from base import utils
-from datastore import data_handler
-from datastore import data_types
-from google_cloud_utils import blobs
+from clusterfuzz._internal.base import errors
+from clusterfuzz._internal.base import utils
+from clusterfuzz._internal.datastore import data_handler
+from clusterfuzz._internal.datastore import data_types
+from clusterfuzz._internal.google_cloud_utils import blobs
 from handlers import base_handler
 from libs import crash_access
 from libs import filters
@@ -43,8 +43,10 @@ FIELDS = [
     'group_id',
     'project_name',
     'platform',
+    'impact_extended_stable_version',
     'impact_stable_version',
     'impact_beta_version',
+    'impact_head_version',
     'is_impact_set_flag',
 ]
 
@@ -68,6 +70,8 @@ KEYWORD_FILTERS = [
     GroupFilter(),
     filters.String('bug_indices', 'issue'),
     filters.String('platform', 'platform'),
+    filters.String('impact_extended_stable_version_indices', 'extended_stable'),
+    filters.String('impact_head_version_indices', 'head'),
     filters.String('impact_stable_version_indices', 'stable'),
     filters.String('impact_beta_version_indices', 'beta'),
     filters.String('fuzzer_name_indices', 'fuzzer'),
@@ -140,8 +144,10 @@ def get_result():
         'isSecurity': testcase.security_flag,
         'isImpactSet': testcase.is_impact_set_flag,
         'impacts': {
+            'extendedStable': testcase.impact_extended_stable_version,
             'stable': testcase.impact_stable_version,
             'beta': testcase.impact_beta_version,
+            'head': testcase.impact_head_version,
         },
         'regressionRange': regression_range,
         'fixedRange': fixed_range,
@@ -174,19 +180,13 @@ class Handler(base_handler.Handler):
   """Handler that gets the testcase list when user first lands on the page."""
 
   @handler.get(handler.HTML)
+  @handler.oauth
   def get(self):
     """Get and render the testcase list in HTML."""
     result, params = get_result()
     field_values = {
-        'projects':
-            data_handler.get_all_project_names(),
-        'fuzzers':
-            data_handler.get_all_fuzzer_names_including_children(
-                include_parents=True),
-        'jobs':
-            data_handler.get_all_job_type_names(),
-        'shouldShowImpact':
-            utils.is_chromium()
+        'projects': data_handler.get_all_project_names(),
+        'shouldShowImpact': utils.is_chromium()
     }
     return self.render('testcase-list.html', {
         'fieldValues': field_values,

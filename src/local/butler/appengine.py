@@ -13,7 +13,6 @@
 # limitations under the License.
 """App Engine helpers."""
 
-from distutils import spawn
 import os
 import shutil
 import sys
@@ -28,7 +27,8 @@ def _add_env_vars_if_needed(yaml_path, additional_env_vars):
   """Add environment variables to yaml file if necessary."""
   # Defer imports since our python paths have to be set up first.
   import yaml
-  from src.python.config import local_config
+
+  from src.clusterfuzz._internal.config import local_config
 
   env_values = local_config.ProjectConfig().get('env')
   if additional_env_vars:
@@ -74,7 +74,7 @@ def find_sdk_path():
   if common.get_platform() == 'windows':
     _, gcloud_path = common.execute('where gcloud.cmd', print_output=False)
   else:
-    gcloud_path = spawn.find_executable('gcloud')
+    gcloud_path = shutil.which('gcloud')
 
   if not gcloud_path:
     print('Please install the Google Cloud SDK and set up PATH to point to it.')
@@ -96,11 +96,8 @@ def symlink_dirs():
   symlink_config_dir()
 
   common.symlink(
-      src=os.path.join('src', 'protos'),
-      target=os.path.join(SRC_DIR_PY, 'protos'))
-  common.symlink(
-      src=os.path.join('src', 'python'),
-      target=os.path.join(SRC_DIR_PY, 'python'))
+      src=os.path.join('src', 'clusterfuzz'),
+      target=os.path.join(SRC_DIR_PY, 'clusterfuzz'))
 
   # Remove existing local_gcs symlink (if any). This is important, as otherwise
   # we will try deploying the directory in production. This is only needed for
@@ -111,7 +108,7 @@ def symlink_dirs():
 
 def build_templates():
   """Build template files used in appengine."""
-  common.execute('python polymer_bundler.py', cwd='local')
+  common.execute('python3 polymer_bundler.py', cwd='local')
 
 
 def symlink_config_dir():

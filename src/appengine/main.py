@@ -17,7 +17,6 @@ import os
 import sys
 
 # Add necessary directories to path.
-sys.path.append('python')
 sys.path.append('third_party')
 
 config_modules_path = os.path.join('config', 'modules')
@@ -34,11 +33,12 @@ if gae_env:
     firebase_admin.initialize_app()
 
 try:
-  # Run any module initialization code.
+  # Run module initialization code for internal issue tracker
   import module_init
-  module_init.appengine()
+  module_init.init()
 except ImportError:
   pass
 
 import server
+
 app = server.app

@@ -15,29 +15,31 @@
 
 import datetime
 import html
-import jinja2
 import re
 
-from flask import request
+import flask
+import jinja2
+import markupsafe
 
-from base import utils
-from build_management import revisions
-from build_management import source_mapper
-from config import db_config
-from crash_analysis import severity_analyzer
-from datastore import data_handler
-from datastore import data_types
-from fuzzing import leak_blacklist
-from google_cloud_utils import blobs
+from clusterfuzz._internal.base import utils
+from clusterfuzz._internal.build_management import revisions
+from clusterfuzz._internal.build_management import source_mapper
+from clusterfuzz._internal.config import db_config
+from clusterfuzz._internal.crash_analysis import severity_analyzer
+from clusterfuzz._internal.datastore import data_handler
+from clusterfuzz._internal.datastore import data_types
+from clusterfuzz._internal.fuzzing import leak_blacklist
+from clusterfuzz._internal.google_cloud_utils import blobs
+from clusterfuzz._internal.issue_management import issue_tracker_utils
+from clusterfuzz._internal.metrics import crash_stats
+from clusterfuzz._internal.system import environment
 from handlers import base_handler
+from handlers.testcase_detail import testcase_status_events
 from libs import access
 from libs import auth
 from libs import form
 from libs import handler
 from libs import helpers
-from libs.issue_management import issue_tracker_utils
-from metrics import crash_stats
-from system import environment
 
 FIND_SIMILAR_ISSUES_OPTIONS = [{
     'type': 'open',
@@ -61,6 +63,20 @@ COMPILED_CRASH_STATE_REGEXES = [
 KERNEL_LINK_REGEX = re.compile(
     r'(.+)(http:\/\/go\/pakernel\/[^;]+);([^;]+);(.*)')
 KERNEL_LINK_FORMAT = r'%s<a href="%s">%s</a>%s'
+
+STACKTRACE_MAX_LENGTH = 500000
+
+
+def _truncate_stacktrace(stacktrace):
+  """Truncate stacktrace if necessary."""
+  if len(stacktrace) > STACKTRACE_MAX_LENGTH:
+    # Read first and last |STACKTRACE_MAX_LENGTH/2| bytes.
+    truncated = len(stacktrace) - STACKTRACE_MAX_LENGTH
+    return (stacktrace[:STACKTRACE_MAX_LENGTH // 2] +
+            f'...truncated {truncated} bytes...' +
+            stacktrace[-STACKTRACE_MAX_LENGTH // 2:])
+
+  return stacktrace
 
 
 def _parse_suspected_cls(predator_result):
@@ -176,13 +192,18 @@ def filter_stacktrace(crash_stacktrace, crash_type, revisions_dict, platform,
   if not crash_stacktrace:
     return ''
 
+  # Truncate stacktrace if it's too big.
+  crash_stacktrace = _truncate_stacktrace(crash_stacktrace)
+
   filtered_crash_lines = []
+  linkifier = source_mapper.StackFrameLinkifier(revisions_dict)
   for line in crash_stacktrace.splitlines():
     # Html escape line content to prevent XSS.
     line = html.escape(line, quote=True)
-    line = source_mapper.linkify_stack_frame(line, revisions_dict)
+    line = linkifier.linkify_stack_frame(line)
 
-    if 'android' in platform or environment.is_lkl_job(job_type):
+    is_android = platform is not None and 'android' in platform
+    if is_android or environment.is_lkl_job(job_type):
       line = _linkify_android_kernel_stack_frame_if_needed(line)
 
     filtered_crash_lines.append(line)
@@ -195,7 +216,7 @@ def filter_stacktrace(crash_stacktrace, crash_type, revisions_dict, platform,
   return highlight_common_stack_frames(filtered_crash_stacktrace)
 
 
-class Line(object):
+class Line:
   """Represent a stacktrace line."""
 
   def __init__(self, line_number, content, important):
@@ -220,25 +241,6 @@ class Line(object):
         'important': self.important,
         'type': 'Line'
     }
-
-
-class Gap(object):
-  """Represent a gap in a previewed stacktrace."""
-
-  def __init__(self, size):
-    self.size = size
-
-  def __str__(self):
-    return 'Gap(%d)' % self.size
-
-  def __eq__(self, other):
-    return hash(self) == hash(other)
-
-  def __hash__(self):
-    return hash(self.__str__())
-
-  def to_dict(self):
-    return {'type': 'Gap', 'size': self.size}
 
 
 def _is_line_important(line_content, frames):
@@ -278,7 +280,7 @@ def convert_to_lines(raw_stacktrace, crash_state_lines, crash_type):
   raw_lines = raw_stacktrace.splitlines()
 
   frames = get_stack_frames(crash_state_lines)
-  escaped_frames = [jinja2.escape(f) for f in frames]
+  escaped_frames = [markupsafe.escape(f) for f in frames]
   combined_frames = frames + escaped_frames
 
   # Certain crash types have their own customized frames that are not related to
@@ -302,7 +304,7 @@ def get_testcase_detail_by_id(testcase_id):
   return get_testcase_detail(testcase)
 
 
-def _get_revision_range_html_from_string(job_type, revision_range):
+def _get_revision_range_html_from_string(job_type, platform_id, revision_range):
   """Return revision range html for a revision range and job type given a range
   string."""
   try:
@@ -310,19 +312,26 @@ def _get_revision_range_html_from_string(job_type, revision_range):
   except:
     return 'Bad revision range.'
 
-  return _get_revision_range_html(job_type, start_revision, end_revision)
+  return _get_revision_range_html(job_type, platform_id, start_revision,
+                                  end_revision)
 
 
-def _get_revision_range_html(job_type, start_revision, end_revision=None):
+def _get_revision_range_html(job_type,
+                             platform_id,
+                             start_revision,
+                             end_revision=None):
   """Return revision range html for a revision range and job type."""
   if end_revision is None:
     end_revision = start_revision
 
   component_rev_list = revisions.get_component_range_list(
-      start_revision, end_revision, job_type)
+      start_revision, end_revision, job_type, platform_id=platform_id)
   if not component_rev_list:
-    return ('%s:%s (No component revisions found!)' % (start_revision,
-                                                       end_revision))
+    # The revisions may come from testcase metadata written by an untrusted
+    # worker, and the result of this function is bound with inner-h-t-m-l.
+    return ('%s:%s (No component revisions found!)' %
+            (html.escape(str(start_revision), quote=True),
+             html.escape(str(end_revision), quote=True)))
 
   return revisions.format_revision_list(component_rev_list)
 
@@ -374,8 +383,8 @@ def get_testcase_detail(testcase):
   elif testcase.regression == 'NA':
     regression = 'NA'
   else:
-    regression = _get_revision_range_html_from_string(testcase.job_type,
-                                                      testcase.regression)
+    regression = _get_revision_range_html_from_string(
+        testcase.job_type, testcase.platform_id, testcase.regression)
 
   fixed_full = None
   if 'progression_pending' in metadata:
@@ -388,19 +397,19 @@ def get_testcase_detail(testcase):
     fixed = 'YES'
   else:
     fixed = 'YES'
-    fixed_full = _get_revision_range_html_from_string(testcase.job_type,
-                                                      testcase.fixed)
+    fixed_full = _get_revision_range_html_from_string(
+        testcase.job_type, testcase.platform_id, testcase.fixed)
 
   last_tested = None
   last_tested_revision = (
       metadata.get('last_tested_revision') or testcase.crash_revision)
   if last_tested_revision:
-    last_tested = _get_revision_range_html(testcase.job_type,
-                                           last_tested_revision)
+    last_tested = _get_revision_range_html(
+        testcase.job_type, testcase.platform_id, last_tested_revision)
 
   crash_revision = testcase.crash_revision
   crash_revisions_dict = revisions.get_component_revisions_dict(
-      crash_revision, testcase.job_type)
+      crash_revision, testcase.job_type, platform_id=testcase.platform_id)
   crash_stacktrace = data_handler.get_stacktrace(testcase)
   crash_stacktrace = filter_stacktrace(crash_stacktrace, testcase.crash_type,
                                        crash_revisions_dict, testcase.platform,
@@ -410,7 +419,9 @@ def get_testcase_detail(testcase):
 
   last_tested_crash_revision = metadata.get('last_tested_crash_revision')
   last_tested_crash_revisions_dict = revisions.get_component_revisions_dict(
-      last_tested_crash_revision, testcase.job_type)
+      last_tested_crash_revision,
+      testcase.job_type,
+      platform_id=testcase.platform_id)
   last_tested_crash_stacktrace = data_handler.get_stacktrace(
       testcase, stack_attribute='last_tested_crash_stacktrace')
   last_tested_crash_stacktrace = filter_stacktrace(
@@ -431,7 +442,8 @@ def get_testcase_detail(testcase):
       testcase.has_blame() and 'blame_pending' in metadata and
       metadata['blame_pending'])
   pending_impact_task = (
-      testcase.has_impacts() and not testcase.is_impact_set_flag)
+      testcase.has_impacts() and not testcase.is_impact_set_flag and
+      data_handler.is_impact_required(testcase))
   pending_minimize_task = not testcase.minimized_keys
   pending_progression_task = ('progression_pending' in metadata and
                               metadata['progression_pending'])
@@ -439,7 +451,7 @@ def get_testcase_detail(testcase):
   pending_stack_task = testcase.last_tested_crash_stacktrace == 'Pending'
   needs_refresh = (
       testcase.status == 'Pending' or
-      ((testcase.status == 'Processed' or testcase.status == 'Duplicate') and
+      (testcase.status in ('Processed', 'Duplicate') and
        (pending_blame_task or pending_impact_task or pending_minimize_task or
         pending_progression_task or pending_regression_task or
         pending_stack_task)))
@@ -476,16 +488,17 @@ def get_testcase_detail(testcase):
   memory_tool_display_label = memory_tool_display_string.split(':')[0]
   memory_tool_display_value = memory_tool_display_string.split(':')[1].strip()
 
-  helpers.log('Testcase %s' % testcase.key.id(), helpers.VIEW_OPERATION)
+  testcase_id = testcase.key.id()
+  helpers.log('Testcase %s' % testcase_id, helpers.VIEW_OPERATION)
   return {
       'id':
-          testcase.key.id(),
+          testcase_id,
       'crash_type':
           crash_type,
       'crash_address':
           crash_address,
       'crash_state':
-          crash_state,  # Used by reproduce tool.
+          crash_state,
       'crash_state_lines':
           crash_state_lines,
       'crash_revision':
@@ -523,14 +536,20 @@ def get_testcase_detail(testcase):
               crash_stacktrace,
           'revision':
               revisions.get_real_revision(
-                  crash_revision, testcase.job_type, display=True)
+                  crash_revision,
+                  testcase.job_type,
+                  display=True,
+                  platform_id=testcase.platform_id)
       },
       'last_tested_crash_stacktrace': {
           'lines':
               last_tested_crash_stacktrace,
           'revision':
               revisions.get_real_revision(
-                  last_tested_crash_revision, testcase.job_type, display=True)
+                  last_tested_crash_revision,
+                  testcase.job_type,
+                  display=True,
+                  platform_id=testcase.platform_id)
       },
       'security_severity':
           security_severity,
@@ -544,6 +563,10 @@ def get_testcase_detail(testcase):
           _parse_suspected_cls(metadata.get('predator_result')),
       'testcase':
           testcase,
+      'testcase_event_history':
+          testcase_status_events.get_testcase_event_history(testcase_id),
+      'testcase_status_info':
+          testcase_status_events.get_testcase_status_info(testcase_id),
       'timestamp':
           utils.utc_datetime_to_timestamp(testcase.timestamp),
       'show_blame':
@@ -597,9 +620,9 @@ class DeprecatedHandler(base_handler.Handler):
 
   def get(self):
     """Serve the redirect to the current test case detail page."""
-    testcase_id = request.args.get('key')
+    testcase_id = flask.request.args.get('key')
     if not testcase_id:
-      raise helpers.EarlyExitException('No testcase key provided.', 400)
+      raise helpers.EarlyExitError('No testcase key provided.', 400)
 
     return self.redirect('/testcase-detail/%s' % testcase_id)
 
@@ -611,5 +634,32 @@ class RefreshHandler(base_handler.Handler):
   @handler.oauth
   def post(self):
     """Serve the testcase detail JSON."""
-    testcase_id = request.get('testcaseId')
+    testcase_id = flask.request.get('testcaseId')
     return self.render_json(get_testcase_detail_by_id(testcase_id))
+
+
+class TaskLogHandler(base_handler.Handler):
+  """Handler for downloading a task's log."""
+
+  @handler.get(handler.TEXT)
+  def get(self):
+    """Serve the task log."""
+    testcase = access.check_access_and_get_testcase(
+        flask.request.args.get('testcase_id'))
+
+    task_id = flask.request.args.get('task_id')
+    if not task_id:
+      raise helpers.EarlyExitError('No task ID provided.', 400)
+
+    task_name = flask.request.args.get('task_name')
+    if not task_name:
+      raise helpers.EarlyExitError('No task name provided.', 400)
+
+    log_content = testcase_status_events.get_task_log(testcase.key.id(),
+                                                      task_id, task_name)
+
+    response = flask.make_response(log_content)
+    response.headers['Content-Type'] = 'text/plain; charset=utf-8'
+    response.headers['Content-Disposition'] = (
+        f'attachment; filename="task_{task_id}_log.txt"')
+    return response

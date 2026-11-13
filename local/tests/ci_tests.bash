@@ -14,25 +14,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-IMAGE=gcr.io/clusterfuzz-images/ci
+IMAGE=gcr.io/clusterfuzz-images/ci:bc696af-202407021946
 
 docker run -i --rm \
   -e PIPENV_VENV_IN_PROJECT=1 \
+  -e IS_GITHUB_ACTIONS=true \
   -v $(pwd):/workspace \
   $IMAGE \
-  pipenv sync --dev
+  pipenv sync --dev --python=python3.11
 docker run -i --rm \
   -e PIPENV_VENV_IN_PROJECT=1 \
+  -e IS_GITHUB_ACTIONS=true \
   -v $(pwd):/workspace \
   $IMAGE \
   pipenv run setup
 docker run -i --rm \
   -e PIPENV_VENV_IN_PROJECT=1 \
+  -e IS_GITHUB_ACTIONS=true \
   -v $(pwd):/workspace \
   $IMAGE \
   pipenv run python butler.py lint
 docker run -i --rm --privileged --cap-add=all \
   -e PIPENV_VENV_IN_PROJECT=1 \
+  -e IS_GITHUB_ACTIONS=true \
   -v $(pwd):/workspace \
   $IMAGE \
   pipenv run local/tests/run_tests

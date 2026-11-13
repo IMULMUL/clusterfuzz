@@ -15,7 +15,7 @@
 
 from flask import request
 
-from base import tasks
+from clusterfuzz._internal.base import tasks
 from handlers import base_handler
 from handlers.testcase_detail import show
 from libs import handler
@@ -31,7 +31,7 @@ class Handler(base_handler.Handler):
     try:
       tasks.redo_testcase(testcase, testcase_tasks, user_email)
     except tasks.InvalidRedoTask as error:
-      raise helpers.EarlyExitException(str(error), 400)
+      raise helpers.EarlyExitError(str(error), 400)
 
     helpers.log('Redo testcase %d: %s' % (testcase.key.id(), testcase_tasks),
                 helpers.MODIFY_OPERATION)

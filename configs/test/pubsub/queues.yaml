@@ -44,6 +44,8 @@ resources:
     type: queue.jinja
   - name: jobs-android-x86
     type: queue.jinja
+  - name: jobs-android-emulator
+    type: queue.jinja
   - name: high-end-jobs-android-x86
     type: queue.jinja
   - name: jobs-android-local-devices
@@ -63,4 +65,10 @@ resources:
   - name: high-end-jobs-fuchsia
     type: queue.jinja
   - name: ml-jobs-linux
+    type: queue.jinja
+  - name: utask_main
+    type: queue.jinja
+  - name: preprocess
+    type: queue.jinja
+  - name: postprocess
     type: queue.jinja

@@ -24,18 +24,26 @@ permalink: /contributing-code/source-code/
 * **local** - artifacts for local testing (e.g. install_deps.bash for ClusterFuzz deps).
 * **resources** - helper binaries needed by bots (e.g. llvm-symbolizer).
 * **src** - source code root.
-  * **appengine** - App Engine specific files (Python 2).
+  * **appengine** - App Engine specific files.
     * **handlers** - backend code for various web pages.
     * **libs** - general helper libraries (e.g. access control).
     * **private** - original template code for various web pages (Polymer 2).
     * **templates** - auto-generated minimized template code for various web pages (Polymer 2).
-  * **go** - go code.
-  * **python** - python 2 code.
-    * **bot** - bot specific code.
-    * **tests** - tests for core and App Engine code.
-    * rest are *package* level directories.
+  * **clusterfuzz** - python  code.
+    * **_internal** - Internal/private modules.
+    * **_internal/tests** - tests for core and App Engine code.
+    * rest are public modules.
   * **third_party** - third-party package dependencies.
-  * **requirements.txt** - platform agnostic package list (Python 2).
-  * **platform_requirements.txt** - platform dependent package list (Python 2).
+  * **requirements.txt** - platform agnostic package list.
+  * **platform_requirements.txt** - platform dependent package list.
 * **bower.json** - component dependencies for Polymer 2.
 * **butler.py** - helper script for various command line tasks (e.g. testing, deployment).
+
+## Pitfalls
+
+* **App Engine imports** - Directories listed in
+  [`.gcloudignore`](https://github.com/google/clusterfuzz/blob/master/src/appengine/.gcloudignore)
+  are not uploaded to App Engine. Shared modules cannot use top-level imports
+  from these directories, as this causes a `ModuleNotFoundError` on App Engine
+  startup. Instead, import them locally inside the functions or methods where
+  they are used.

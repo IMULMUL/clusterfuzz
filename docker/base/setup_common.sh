@@ -33,19 +33,30 @@ then
   export PREEMPTIBLE=True
 fi
 
+is_truthy() {
+  [[ "$1" =~ ^([Tt]rue|1)$ ]]
+}
+
 # Make sure mounted volume doesn't have noexec,nosuid,nodev
-mount /mnt/scratch0 -o remount,exec,suid,dev
+# Running this in k8s or swarming environment will cause mounting errors
+should_mount() {
+  # Skip if running in Kubernetes or as a Swarming Job
+  if is_truthy "$IS_K8S_ENV" || is_truthy "$SWARMING_BOT"; then
+    return 1
+  fi
+
+  return 0
+}
+
+if should_mount; then
+  mount /mnt/scratch0 -o remount,exec,suid,dev
+fi
 
 # Prevent /dev/random hangs.
-if [[ -z "$DISABLE_DEV_RANDOM_RENAME" ]] 
+if [[ -z "$DISABLE_DEV_RANDOM_RENAME" ]]
 then
   rm /dev/random
   ln -s /dev/urandom /dev/random
-fi
-
-# Running without credentials will cause this to fail.
-if [[ -z "$LOCAL_SRC" ]]; then
-  /etc/init.d/google-fluentd restart
 fi
 
 # Prevent anything from being written to downloads directory.

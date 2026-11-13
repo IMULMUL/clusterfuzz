@@ -22,13 +22,18 @@ import re
 import sys
 import tempfile
 import time
+from typing import Any
+
+import pytz
 
 from local.butler import appengine
 from local.butler import common
 from local.butler import constants
 from local.butler import package
-from src.python.config import local_config
-from src.python.system import environment
+from src.clusterfuzz._internal.base import utils
+from src.clusterfuzz._internal.config import local_config
+from src.clusterfuzz._internal.metrics import monitoring_metrics
+from src.clusterfuzz._internal.system import environment
 
 EXPECTED_BOT_COUNT_PERCENT = 0.8
 
@@ -46,9 +51,13 @@ SERVICE_REGEX = re.compile(r'service\s*:\s*(.*)')
 Version = namedtuple('Version', ['id', 'deploy_time', 'traffic_split'])
 
 
-def now():
+class DeploymentError(Exception):
+  """Deployment Error"""
+
+
+def now(tz=None):
   """Used for mocks."""
-  return datetime.datetime.now()
+  return datetime.datetime.now(tz)
 
 
 def _get_services(paths):
@@ -87,11 +96,14 @@ def _additional_app_env_vars(project):
   }
 
 
+# TODO: Add structured log
 def _deploy_app_prod(project,
                      deployment_bucket,
                      yaml_paths,
                      package_zip_paths,
-                     deploy_appengine=True):
+                     deploy_appengine=True,
+                     test_deployment=False,
+                     release='prod'):
   """Deploy app in production."""
   if deploy_appengine:
     services = _get_services(yaml_paths)
@@ -109,9 +121,17 @@ def _deploy_app_prod(project,
 
   if package_zip_paths:
     for package_zip_path in package_zip_paths:
-      _deploy_zip(deployment_bucket, package_zip_path)
+      _deploy_zip(
+          deployment_bucket, package_zip_path, test_deployment=test_deployment)
 
-    _deploy_manifest(deployment_bucket, constants.PACKAGE_TARGET_MANIFEST_PATH)
+    releases = [release]
+    releases += constants.ADDITIONAL_RELEASES if release == 'prod' else []
+    for rel in releases:
+      _deploy_manifest(
+          deployment_bucket,
+          constants.PACKAGE_TARGET_MANIFEST_PATH,
+          test_deployment=test_deployment,
+          release=rel)
 
 
 def _deploy_app_staging(project, yaml_paths):
@@ -212,22 +232,33 @@ def find_file_exceeding_limit(path, limit):
   return None
 
 
-def _deploy_zip(bucket_name, zip_path):
+def _deploy_zip(bucket_name, zip_path, test_deployment=False):
   """Deploy zip to GCS."""
-  common.execute('gsutil cp %s gs://%s/%s' % (zip_path, bucket_name,
-                                              os.path.basename(zip_path)))
-
-
-def _deploy_manifest(bucket_name, manifest_path):
-  """Deploy source manifest to GCS."""
-  if sys.version_info.major == 3:
-    manifest_suffix = '.3'
+  gcloud_storage = common.Gcloud(storage=True)
+  if test_deployment:
+    gcloud_storage.run(
+        'cp', zip_path,
+        f'gs://{bucket_name}/test-deployment/{os.path.basename(zip_path)}')
   else:
-    manifest_suffix = ''
+    gcloud_storage.run('cp', zip_path,
+                       f'gs://{bucket_name}/{os.path.basename(zip_path)}')
 
-  common.execute('gsutil cp -a public-read %s '
-                 'gs://%s/clusterfuzz-source.manifest%s' %
-                 (manifest_path, bucket_name, manifest_suffix))
+
+def _deploy_manifest(bucket_name,
+                     manifest_path,
+                     test_deployment=False,
+                     release='prod'):
+  """Deploy source manifest to GCS."""
+  gcloud_storage = common.Gcloud(storage=True)
+  remote_manifest_path = utils.get_remote_manifest_filename(release)
+
+  if test_deployment:
+    gcloud_storage.run(
+        'cp', manifest_path, f'gs://{bucket_name}/test-deployment/'
+        f'{remote_manifest_path}')
+  else:
+    gcloud_storage.run('cp', manifest_path,
+                       f'gs://{bucket_name}/{remote_manifest_path}')
 
 
 def _update_deployment_manager(project, name, config_path):
@@ -323,46 +354,25 @@ def _update_bigquery(project):
                    'datasets.yaml'))
 
 
-def _update_redis(project):
-  """Update redis instance."""
-  _update_deployment_manager(
-      project, 'redis',
-      os.path.join(environment.get_config_directory(), 'redis',
-                   'instance.yaml'))
-
-  region = appengine.region(project)
-  return_code, _ = common.execute(
-      'gcloud compute networks vpc-access connectors describe '
-      'connector --region={region} '
-      '--project={project}'.format(project=project, region=region),
-      exit_on_error=False)
-
-  if return_code:
-    # Does not exist.
-    common.execute('gcloud compute networks vpc-access connectors create '
-                   'connector --network=default --region={region} '
-                   '--range=10.8.0.0/28 '
-                   '--project={project}'.format(project=project, region=region))
-
-
-def get_remote_sha():
+def get_remote_sha(git_dir: str = '.'):
   """Get remote sha of origin/master."""
-  _, remote_sha_line = common.execute('git ls-remote origin refs/heads/master')
+  _, remote_sha_line = common.execute(
+      f'git -C {git_dir} ls-remote origin refs/heads/master')
 
   return re.split(br'\s+', remote_sha_line)[0]
 
 
-def is_diff_origin_master():
+def is_diff_origin_master(git_dir: str = '.'):
   """Check if the current state is different from origin/master."""
-  common.execute('git fetch')
-  remote_sha = get_remote_sha()
-  _, local_sha = common.execute('git rev-parse HEAD')
-  _, diff_output = common.execute('git diff origin/master --stat')
+  common.execute(f'git -C {git_dir} fetch')
+  remote_sha = get_remote_sha(git_dir)
+  _, local_sha = common.execute(f'git -C {git_dir} rev-parse HEAD')
+  _, diff_output = common.execute(f'git -C {git_dir} diff origin/master --stat')
 
   return diff_output.strip() or remote_sha.strip() != local_sha.strip()
 
 
-def _staging_deployment_helper(python3=True):
+def _staging_deployment_helper():
   """Helper for staging deployment."""
   config = local_config.Config(local_config.GAE_CONFIG_PATH)
   project = config.get('application_id')
@@ -370,21 +380,24 @@ def _staging_deployment_helper(python3=True):
   print('Deploying %s to staging.' % project)
   deployment_config = config.sub_config('deployment')
 
-  if python3:
-    path = 'staging3'
-  else:
-    path = 'staging'
-
+  path = 'staging3'
   yaml_paths = deployment_config.get_absolute_path(path)
 
   _deploy_app_staging(project, yaml_paths)
   print('Staging deployment finished.')
 
 
+# We need to import the wrap_with_monitoring through monitoring_metrics
+# monitor's import because we need to point to the same module instance
+# for assuring the same metric store we increment the metric will have
+# the metrics flushed by the monitoring thread.
+@monitoring_metrics.monitor.wrap_with_monitoring()
 def _prod_deployment_helper(config_dir,
                             package_zip_paths,
                             deploy_appengine=True,
-                            python3=True):
+                            deploy_terraform=True,
+                            test_deployment=False,
+                            release='prod'):
   """Helper for production deployment."""
   config = local_config.Config()
   deployment_bucket = config.get('project.deployment.bucket')
@@ -394,10 +407,7 @@ def _prod_deployment_helper(config_dir,
   project = gae_config.get('application_id')
 
   print('Deploying %s to prod.' % project)
-  if python3:
-    path = 'prod3'
-  else:
-    path = 'prod'
+  path = 'prod3'
 
   yaml_paths = gae_deployment.get_absolute_path(path, default=[])
   if not yaml_paths:
@@ -407,26 +417,78 @@ def _prod_deployment_helper(config_dir,
     _update_pubsub_queues(project)
     _update_alerts(project)
     _update_bigquery(project)
-    _update_redis(project)
 
-  _deploy_app_prod(
-      project,
-      deployment_bucket,
-      yaml_paths,
-      package_zip_paths,
-      deploy_appengine=deploy_appengine)
+  labels: dict[str, Any] = {
+      'deploy_zip': bool(package_zip_paths),
+      'deploy_app_engine': deploy_appengine,
+      'deploy_kubernetes': False,
+      'deploy_terraform': deploy_terraform,
+      'success': True,
+      'release': release,
+      'clusterfuzz_version': utils.current_source_version()
+  }
 
-  if deploy_appengine:
-    common.execute('python butler.py run setup --config-dir {config_dir} '
-                   '--non-dry-run'.format(config_dir=config_dir))
-  print('Production deployment finished.')
+  try:
+    # Appengine depends on Redis, which is managed by Terraform
+    # Therefore, we need to deploy Terraform first
+    if deploy_terraform:
+      _deploy_terraform(config_dir)
+    _deploy_app_prod(
+        project,
+        deployment_bucket,
+        yaml_paths,
+        package_zip_paths,
+        deploy_appengine=deploy_appengine,
+        test_deployment=test_deployment,
+        release=release)
+
+    if deploy_appengine:
+      common.execute(
+          f'python butler.py run setup --config-dir {config_dir} --non-dry-run')
+
+    print(f'Production deployment finished. {labels}')
+    monitoring_metrics.PRODUCTION_DEPLOYMENT.increment(labels)
+  except Exception as ex:
+    labels.update({'success': False})
+    monitoring_metrics.PRODUCTION_DEPLOYMENT.increment(labels)
+    raise DeploymentError from ex
+
+
+def _deploy_terraform(config_dir):
+  """Deploys GKE cluster via terraform."""
+  terraform_dir = os.path.join(config_dir, 'terraform')
+  terraform = f'terraform -chdir={terraform_dir}'
+  common.execute(f'{terraform} init')
+  common.execute(f'{terraform} apply -target=module.clusterfuzz -auto-approve')
+  common.execute(f'rm -rf {terraform_dir}/.terraform*')
+
+
+def _is_safe_deploy_day():
+  time_now_in_ny = now(pytz.timezone('America/New_York'))
+  day_now_in_ny = time_now_in_ny.weekday()
+  return day_now_in_ny not in {4, 5, 6}  # The days of the week are 0-indexed.
+
+
+def _enforce_safe_day_to_deploy():
+  """Checks that is not an unsafe day (Friday, Saturday, or Sunday) to
+  deploy for chrome ClusterFuzz."""
+
+  config = local_config.Config()
+  if config.get('weekend_deploy_allowed', True):
+    return
+
+  if not _is_safe_deploy_day():
+    raise RuntimeError('Cannot deploy Fri-Sun to this CF instance except for '
+                       'urgent fixes. See b/384493595. If needed, temporarily '
+                       'delete+commit this. You are not too l33t for this '
+                       'rule. Do not break it!')
 
 
 def execute(args):
   """Deploy Clusterfuzz to Appengine."""
-  if sys.version_info.major != 3 or sys.version_info.minor != 7:
-    print('You can only deploy from Python 3.7. Install Python 3.7 and '
-          'run: `PYTHON=python3.7 local/install_deps.bash`')
+  if sys.version_info.major != 3 or sys.version_info.minor != 11:
+    print('You can only deploy from Python 3.11. Install Python 3.11 and '
+          'run: `PYTHON=python3.11 local/install_deps.bash`')
     sys.exit(1)
 
   os.environ['ROOT_DIR'] = '.'
@@ -438,7 +500,7 @@ def execute(args):
   os.environ['CONFIG_DIR_OVERRIDE'] = args.config_dir
 
   if not common.has_file_in_path('gcloud'):
-    print('Please install gcloud.')
+    print('gcloud not found in PATH. Please install gcloud.')
     sys.exit(1)
 
   is_ci = os.getenv('TEST_BOT_ENVIRONMENT')
@@ -446,23 +508,24 @@ def execute(args):
     print('Your branch is dirty. Please fix before deploying.')
     sys.exit(1)
 
-  if not common.has_file_in_path('gsutil'):
-    print('gsutil not found in PATH.')
-    sys.exit(1)
+  _enforce_safe_day_to_deploy()
 
   # Build templates before deployment.
   appengine.build_templates()
 
   if not is_ci and not args.staging:
-    if is_diff_origin_master():
+    if is_diff_origin_master() or is_diff_origin_master(
+        environment.get_config_directory()):
       if args.force:
-        print('You are not on origin/master. --force is used. Continue.')
+        print('You are not on origin/master for clusterfuzz '
+              'or clusterfuzz-config. --force is used. Continue.')
         for _ in range(3):
           print('.')
           time.sleep(1)
         print()
       else:
-        print('You are not on origin/master. Please fix or use --force.')
+        print('You are not on origin/master for clusterfuzz '
+              'or clusterfuzz-config. Please fix or use --force.')
         sys.exit(1)
 
   if args.staging:
@@ -470,7 +533,7 @@ def execute(args):
     platforms = ['linux']  # No other platforms required.
   elif args.prod:
     revision = common.compute_prod_revision()
-    platforms = list(constants.PLATFORMS.keys())
+    platforms = list(constants.DEPLOYMENT_TARGETS.keys())
   else:
     print('Please specify either --prod or --staging. For production '
           'deployments, you probably want to use deploy.sh from your '
@@ -479,14 +542,19 @@ def execute(args):
 
   deploy_zips = 'zips' in args.targets
   deploy_appengine = 'appengine' in args.targets
+  deploy_terraform = 'terraform' in args.targets
+  test_deployment = 'test_deployment' in args.targets
 
-  is_python3 = sys.version_info.major == 3
+  if test_deployment:
+    deploy_appengine = False
+    deploy_terraform = False
+    deploy_zips = True
+
   package_zip_paths = []
   if deploy_zips:
     for platform_name in platforms:
-      package_zip_paths.append(
-          package.package(
-              revision, platform_name=platform_name, python3=is_python3))
+      package_zip_paths += package.package(
+          revision, platform_name=platform_name, release=args.release)
   else:
     # package.package calls these, so only set these up if we're not packaging,
     # since they can be fairly slow.
@@ -503,13 +571,20 @@ def execute(args):
     sys.exit(1)
 
   if args.staging:
-    _staging_deployment_helper(python3=is_python3)
+    _staging_deployment_helper()
   else:
+    # This workaround is needed to set the env vars APPLICATION_ID and BOT_NAME
+    # for local environment, and it's needed for loading the monitoring module
+    config = local_config.ProjectConfig().get('env')
+    environment.set_value("APPLICATION_ID", config["APPLICATION_ID"])
+    environment.set_value("BOT_NAME", os.uname().nodename)
     _prod_deployment_helper(
         args.config_dir,
         package_zip_paths,
         deploy_appengine,
-        python3=is_python3)
+        deploy_terraform,
+        test_deployment=test_deployment,
+        release=args.release)
 
   with open(constants.PACKAGE_TARGET_MANIFEST_PATH) as f:
     print('Source updated to %s' % f.read())

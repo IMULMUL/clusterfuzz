@@ -113,6 +113,13 @@
         </paper-input>
       </div>
       <div class="inline narrow">
+        <paper-input
+            label="Primary owner (email)"
+            value="{{fuzzer.primary_owner}}"
+            title="Primary owner for VRP rewards.">
+        </paper-input>
+      </div>
+      <div class="inline narrow">
         <paper-menu-button
             class="job-select dropdown-filter"
             no-animations="true"
@@ -121,7 +128,7 @@
           <div slot="dropdown-trigger">
             <paper-input
                 readonly
-                label="Select/modify jobs"
+                label="[[computeJobsLabel(fuzzer.jobs.*)]]"
                 title="Set of jobs to run with this fuzzer.">
               <iron-icon icon="paper-dropdown-menu:arrow-drop-down" suffix slot="suffix"></iron-icon>
             </paper-input>
@@ -220,11 +227,16 @@
       </div>
       <div class="inline narrow">
         <paper-checkbox checked="{{fuzzer.external_contribution}}">External contribution</paper-checkbox>
-
-        <!-- TODO: Re-enable after the differential fuzzing is implemented.
-        <paper-checkbox checked="{{fuzzer.differential}}">Differential fuzzer</paper-checkbox>
-        -->
       </div>
+      <div class="inline narrow">
+        <paper-checkbox checked="{{fuzzer.trusted}}">Trusted</paper-checkbox>
+      </div>
+
+      <!-- TODO: Re-enable after the differential fuzzing is implemented.
+      <div class="inline narrow">
+        <paper-checkbox checked="{{fuzzer.differential}}">Differential fuzzer</paper-checkbox>
+      </div>
+      -->
     </ajax-dialog>
     <iron-ajax
       id="ajaxFinish"
@@ -252,11 +264,13 @@
                 'differential',
                 'executable_path',
                 'external_contribution',
+                'primary_owner',
                 'jobs',
                 'launcher_script',
                 'max_testcases',
                 'name',
                 'timeout',
+                'trusted',
             ],
           },
           file: Object,
@@ -331,6 +345,24 @@
 
       handleFinishResponse(ev) {
         window.location.href = '/fuzzers';
+      }
+
+      static get observers() {
+        return ['fuzzerChanged(fuzzer)'];
+      }
+
+      fuzzerChanged(fuzzer) {
+        // Normalize null and undefined values to match the "None" selector.
+        if (fuzzer && fuzzer.data_bundle_name == null) {
+          this.set('fuzzer.data_bundle_name', '');
+        }
+      }
+
+      computeJobsLabel() {
+        const jobs = this.fuzzer && this.fuzzer.jobs;
+        if (!jobs || jobs.length == 0)
+          return 'No jobs selected';
+        return 'Select/modify jobs';
       }
 
       nameIsReadOnly(create) {

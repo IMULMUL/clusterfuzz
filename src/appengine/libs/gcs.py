@@ -22,10 +22,10 @@ import urllib.parse
 
 import googleapiclient
 
-from base import utils
-from google_cloud_utils import blobs
-from google_cloud_utils import storage
-from system import environment
+from clusterfuzz._internal.base import utils
+from clusterfuzz._internal.google_cloud_utils import blobs
+from clusterfuzz._internal.google_cloud_utils import storage
+from clusterfuzz._internal.system import environment
 
 STORAGE_URL = 'https://storage.googleapis.com/%s'
 DEFAULT_URL_VALID_SECONDS = 30 * 60  # 30 minutes.
@@ -46,7 +46,7 @@ def sign_data(data):
   service_account = 'projects/-/serviceAccounts/' + utils.service_account_email(
   )
 
-  response = iam.projects().serviceAccounts().signBlob(
+  response = iam.projects().serviceAccounts().signBlob(  # pylint: disable=no-member
       name=service_account,
       body={
           'delegates': [],
@@ -59,7 +59,7 @@ def sign_data(data):
     raise GcsError('Invalid response: ' + str(e))
 
 
-class SignedGcsHandler(object):
+class SignedGcsHandler:
   """Handler for signing and redirecting to a GCS object."""
 
   def serve_gcs_object(self, bucket, object_path, content_disposition=None):
@@ -73,7 +73,7 @@ class SignedGcsHandler(object):
 
       url += '&' + urllib.parse.urlencode(content_disposition_params)
 
-    return self.redirect(url)
+    return self.redirect(url)  # pylint: disable=no-member
 
 
 def _get_expiration_time(expiry_seconds):

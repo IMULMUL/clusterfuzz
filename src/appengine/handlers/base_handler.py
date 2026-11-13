@@ -30,15 +30,16 @@ from flask import Response
 from flask.views import MethodView
 from google.cloud import ndb
 import jinja2
+import jira
 
-from base import utils
-from config import db_config
-from config import local_config
-from google_cloud_utils import storage
+from clusterfuzz._internal.base import utils
+from clusterfuzz._internal.config import db_config
+from clusterfuzz._internal.config import local_config
+from clusterfuzz._internal.google_cloud_utils import storage
+from clusterfuzz._internal.system import environment
 from libs import auth
 from libs import form
 from libs import helpers
-from system import environment
 
 # Pattern from
 # https://github.com/google/closure-library/blob/
@@ -55,21 +56,24 @@ class JsonEncoder(json.JSONEncoder):
   """Json encoder."""
   _EPOCH = datetime.datetime.utcfromtimestamp(0)
 
-  def default(self, obj):  # pylint: disable=arguments-differ,method-hidden
-    if isinstance(obj, ndb.Model):
-      dict_obj = obj.to_dict()
-      dict_obj['id'] = obj.key.id()
+  def default(self, o):  # pylint: disable=arguments-differ,method-hidden
+    if isinstance(o, ndb.Model):
+      dict_obj = o.to_dict()
+      dict_obj['id'] = o.key.id()
       return dict_obj
-    if isinstance(obj, datetime.datetime):
-      return int((obj - self._EPOCH).total_seconds())
-    if hasattr(obj, 'to_dict'):
-      return obj.to_dict()
-    if isinstance(obj, cgi.FieldStorage):
-      return str(obj)
-    if isinstance(obj, bytes):
-      return obj.decode('utf-8')
+    if isinstance(o, datetime.datetime):
+      return int((o - self._EPOCH).total_seconds())
+    if hasattr(o, 'to_dict'):
+      return o.to_dict()
+    if isinstance(o, cgi.FieldStorage):
+      return str(o)
+    if isinstance(o, bytes):
+      return o.decode('utf-8')
+    if isinstance(o, jira.resources.Resource):
+      if o.raw:
+        return o.raw
 
-    return json.JSONEncoder.default(self, obj)
+    return json.JSONEncoder.default(self, o)
 
 
 def format_time(dt):
@@ -95,7 +99,7 @@ def encode_json(value):
 _JINJA_ENVIRONMENT = jinja2.Environment(
     loader=jinja2.FileSystemLoader(
         os.path.join(os.path.dirname(__file__), '..', 'templates')),
-    extensions=['jinja2.ext.autoescape'],
+    extensions=[],
     autoescape=True)
 _MENU_ITEMS = []
 
@@ -127,10 +131,10 @@ def make_logout_url(dest_url):
 def check_redirect_url(url):
   """Check redirect URL is safe."""
   if not _SAFE_URL_PATTERN.match(url):
-    raise helpers.EarlyExitException('Invalid redirect.', 403)
+    raise helpers.EarlyExitError('Invalid redirect.', 403)
 
 
-class _MenuItem(object):
+class _MenuItem:
   """A menu item used for rendering an item in the main navigation."""
 
   def __init__(self, name, href):
@@ -182,6 +186,7 @@ class Handler(MethodView):
 
     values['menu_items'] = _MENU_ITEMS
     values['is_oss_fuzz'] = utils.is_oss_fuzz()
+    values['is_chromium'] = utils.is_chromium()
     values['is_development'] = (
         environment.is_running_on_app_engine_development())
     values['is_logged_in'] = bool(helpers.get_user_email())
@@ -229,7 +234,7 @@ class Handler(MethodView):
           'status': status,
           'type': exception.__class__.__name__
       }
-      if isinstance(exception, helpers.EarlyExitException):
+      if isinstance(exception, helpers.EarlyExitError):
         status = exception.status
         values = exception.to_dict()
 
@@ -248,6 +253,8 @@ class Handler(MethodView):
       return self.render('error.html', values, status)
     except Exception:
       self.handle_exception_exception()
+
+    return None
 
   def handle_exception_exception(self):
     """Catch exception in handle_exception and format it properly."""
@@ -268,7 +275,7 @@ class Handler(MethodView):
     """Dispatch a request and postprocess."""
     self.is_json = False
     try:
-      return super(Handler, self).dispatch_request(*args, **kwargs)
+      return super().dispatch_request(*args, **kwargs)
     except Exception as exception:
       return self.handle_exception(exception)
 
@@ -292,7 +299,7 @@ class GcsUploadHandler(Handler):
 
     blob_info = storage.GcsBlobInfo.from_key(upload_key)
     if not blob_info:
-      raise helpers.EarlyExitException('Failed to upload.', 500)
+      raise helpers.EarlyExitError('Failed to upload.', 500)
 
     self.upload = blob_info
     return self.upload

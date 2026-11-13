@@ -15,19 +15,21 @@
 
 import os
 import re
+import shutil
 import sys
 import zipfile
 
 from local.butler import appengine
 from local.butler import common
 from local.butler import constants
+from src.clusterfuzz._internal.base import utils
 
 MIN_SUPPORTED_NODEJS_VERSION = 4
 
 
-def _clear_zip(target_zip_path):
+def _clear_zip(target_zip_path, clear_manifest=True):
   """Remove zip and manifest file."""
-  if os.path.exists(constants.PACKAGE_TARGET_MANIFEST_PATH):
+  if clear_manifest and os.path.exists(constants.PACKAGE_TARGET_MANIFEST_PATH):
     os.remove(constants.PACKAGE_TARGET_MANIFEST_PATH)
 
   if os.path.exists(target_zip_path):
@@ -71,7 +73,7 @@ def package(revision,
             target_zip_dir=constants.PACKAGE_TARGET_ZIP_DIRECTORY,
             target_manifest_path=constants.PACKAGE_TARGET_MANIFEST_PATH,
             platform_name=None,
-            python3=False):
+            release='prod'):
   """Prepare clusterfuzz-source.zip."""
   is_ci = os.getenv('TEST_BOT_ENVIRONMENT')
   if not is_ci and common.is_git_dirty():
@@ -96,34 +98,31 @@ def package(revision,
 
   target_zip_name = constants.LEGACY_ZIP_NAME
   if platform_name:
-    if python3:
-      target_zip_name = platform_name + '-3.zip'
-    else:
-      target_zip_name = platform_name + '.zip'
+    target_zip_name = utils.get_deployment_target_filename(
+        platform_name, release)
 
   target_zip_path = os.path.join(target_zip_dir, target_zip_name)
   _clear_zip(target_zip_path)
 
-  output_file = zipfile.ZipFile(target_zip_path, 'w', zipfile.ZIP_DEFLATED)
+  with zipfile.ZipFile(target_zip_path, 'w',
+                       zipfile.ZIP_DEFLATED) as output_file:
+    # Add files from git.
+    for file_path in file_paths:
+      if (file_path.startswith('config') or file_path.startswith('local') or
+          file_path.startswith(os.path.join('src', 'appengine')) or
+          file_path.startswith(os.path.join('src', 'local')) or
+          file_path.startswith(
+              os.path.join('src', 'clusterfuzz', '_internal', 'tests'))):
+        continue
+      _add_to_zip(output_file, file_path)
 
-  # Add files from git.
-  for file_path in file_paths:
-    if (file_path.startswith('config') or file_path.startswith('local') or
-        file_path.startswith(os.path.join('src', 'appengine')) or
-        file_path.startswith(os.path.join('src', 'local')) or
-        file_path.startswith(os.path.join('src', 'python', 'tests'))):
-      continue
-    _add_to_zip(output_file, file_path)
+    # These are project configuration yamls.
+    for path in _get_files(os.path.join('src', 'appengine', 'config')):
+      _add_to_zip(output_file, path)
 
-  # These are project configuration yamls.
-  for path in _get_files(os.path.join('src', 'appengine', 'config')):
-    _add_to_zip(output_file, path)
-
-  # These are third party dependencies.
-  for path in _get_files(os.path.join('src', 'third_party')):
-    _add_to_zip(output_file, path)
-
-  output_file.close()
+    # These are third party dependencies.
+    for path in _get_files(os.path.join('src', 'third_party')):
+      _add_to_zip(output_file, path)
 
   with open(target_manifest_path, 'w') as f:
     f.write('%s\n' % revision)
@@ -135,15 +134,32 @@ def package(revision,
 
   print()
   print('%s is ready.' % target_zip_path)
-  return target_zip_path
+
+  targets_zip_paths = [target_zip_path]
+  if platform_name and release == 'prod':
+    # Copy prod package into additional releases.
+    for add_release in constants.ADDITIONAL_RELEASES:
+      add_target_zip_name = utils.get_deployment_target_filename(
+          platform_name, release=add_release)
+      add_target_zip_path = os.path.join(target_zip_dir, add_target_zip_name)
+      _clear_zip(add_target_zip_path, clear_manifest=False)
+      shutil.copy2(target_zip_path, add_target_zip_path)
+      print('\n%s is ready.' % add_target_zip_path)
+      targets_zip_paths.append(add_target_zip_path)
+
+  return targets_zip_paths
 
 
 def execute(args):
+  """Execute the butler package command."""
   if args.platform == 'all':
-    for platform_name in list(constants.PLATFORMS.keys()):
+    for platform_name in list(constants.DEPLOYMENT_TARGETS.keys()):
       package(
           revision=common.compute_staging_revision(),
-          platform_name=platform_name)
+          platform_name=platform_name,
+          release=args.release)
   else:
     package(
-        revision=common.compute_staging_revision(), platform_name=args.platform)
+        revision=common.compute_staging_revision(),
+        platform_name=args.platform,
+        release=args.release)

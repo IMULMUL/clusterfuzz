@@ -17,12 +17,12 @@ import datetime
 
 from flask import request
 
-from config import local_config
+from clusterfuzz._internal.config import local_config
+from clusterfuzz._internal.metrics import logs
 from handlers import base_handler
 from libs import auth
 from libs import handler
 from libs import helpers
-from metrics import logs
 
 DEFAULT_REDIRECT = '/'
 SESSION_EXPIRY_DAYS = 14
@@ -57,7 +57,7 @@ class SessionLoginHandler(base_handler.Handler):
     try:
       session_cookie = auth.create_session_cookie(id_token, expires_in)
     except auth.AuthError:
-      raise helpers.EarlyExitException('Failed to create session cookie.', 401)
+      raise helpers.EarlyExitError('Failed to create session cookie.', 401)
 
     expires = datetime.datetime.now() + expires_in
     response = self.render_json({'status': 'success'})
@@ -78,7 +78,7 @@ class LogoutHandler(base_handler.Handler):
       auth.revoke_session_cookie(auth.get_session_cookie())
     except auth.AuthError:
       # Even if the revoke failed, remove the cookie.
-      logs.log_error('Failed to revoke session cookie.')
+      logs.error('Failed to revoke session cookie.')
 
     response = self.redirect(request.get('dest', DEFAULT_REDIRECT))
     response.delete_cookie('session')

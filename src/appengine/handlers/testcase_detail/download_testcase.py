@@ -17,7 +17,7 @@ import urllib.parse
 
 from flask import request
 
-from google_cloud_utils import blobs
+from clusterfuzz._internal.google_cloud_utils import blobs
 from handlers import base_handler
 from libs import access
 from libs import gcs
@@ -39,7 +39,7 @@ def get_testcase_blob_info(testcase):
     using_minimized_keys = False
 
   if not blob_key:
-    raise helpers.EarlyExitException(
+    raise helpers.EarlyExitError(
         "The testcase (%d) doesn't have fuzzed keys." % testcase.key.id(), 400)
 
   blob_key = str(urllib.parse.unquote(blob_key))

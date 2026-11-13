@@ -26,7 +26,7 @@ a software project's development process:
 - Fully automatic bug filing, triage and closing for various issue trackers
   (e.g. [Monorail], [Jira]).
 - Supports multiple [coverage guided fuzzing engines]
-  ([libFuzzer], [AFL] and [Honggfuzz])
+  ([libFuzzer], [AFL++] and [Honggfuzz])
   for optimal results (with [ensemble fuzzing] and [fuzzing strategies]).
 - Support for [blackbox fuzzing].
 - Testcase minimization.
@@ -38,19 +38,19 @@ a software project's development process:
 [Monorail]: https://opensource.google.com/projects/monorail
 
 ## Trophies
-As of September 2020, ClusterFuzz has found 25,000+ bugs in Google (e.g. [Chrome])
-and [~22,500] bugs in over [340] open source projects integrated with [OSS-Fuzz].
+As of May 2022, ClusterFuzz has found 25,000+ bugs in Google (e.g. [Chrome])
+and [36,000+] bugs in over [550] open source projects integrated with [OSS-Fuzz].
 
 [Chrome]: https://bugs.chromium.org/p/chromium/issues/list?can=1&q=label%3AClusterFuzz+-status%3AWontFix%2CDuplicate
-[~22,500]: https://bugs.chromium.org/p/oss-fuzz/issues/list?q=-status%3AWontFix%2CDuplicate%20-component%3AInfra&can=1
-[340]: https://github.com/google/oss-fuzz/tree/master/projects
+[36,000+]: https://bugs.chromium.org/p/oss-fuzz/issues/list?q=-status%3AWontFix%2CDuplicate%20-component%3AInfra&can=1
+[550]: https://github.com/google/oss-fuzz/tree/master/projects
 [OSS-Fuzz]: https://github.com/google/oss-fuzz
 [Monorail]: https://opensource.google.com/projects/monorail
 [Jira]: https://www.atlassian.com/software/jira
 [bisection]: https://en.wikipedia.org/wiki/Bisection_(software_engineering)
 [Firebase]: https://firebase.google.com/docs/auth
 [libFuzzer]: http://llvm.org/docs/LibFuzzer.html
-[AFL]: https://github.com/google/AFL
+[AFL++]: https://github.com/AFLplusplus/AFLplusplus
 [Honggfuzz]: https://github.com/google/honggfuzz
 [blackbox fuzzing]: {{ site.baseurl }}/setting-up-fuzzing/blackbox-fuzzing/
 [coverage guided fuzzing engines]: {{ site.baseurl }}/setting-up-fuzzing/libfuzzer-and-afl/

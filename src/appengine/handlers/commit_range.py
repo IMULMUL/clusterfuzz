@@ -17,7 +17,7 @@ import json
 
 from flask import request
 
-from google_cloud_utils import big_query
+from clusterfuzz._internal.google_cloud_utils import big_query
 from handlers import base_handler
 from libs import crash_access
 from libs import filters
@@ -66,7 +66,7 @@ class RevisionFilter(filters.Filter):
   def add(self, query, params):
     """Set query according to revision and type params."""
     if not params.get('revision'):
-      raise helpers.EarlyExitException('Please specify the revision.', 400)
+      raise helpers.EarlyExitError('Please specify the revision.', 400)
 
     prefix = params['type']
     revision = helpers.cast(params['revision'], int,
@@ -112,7 +112,7 @@ class TypeFilter(filters.Filter):
     value = params.get('type', 'regression')
 
     if value not in ['fixed', 'regression']:
-      raise helpers.EarlyExitException(
+      raise helpers.EarlyExitError(
           "'type' can only be either 'fixed' or 'regression'.", 400)
 
 
@@ -177,6 +177,7 @@ class Handler(base_handler.Handler):
 
   @handler.unsupported_on_local_server
   @handler.get(handler.HTML)
+  @handler.oauth
   def get(self):
     """Get and render the commit range in HTML."""
     result, params = get_result()

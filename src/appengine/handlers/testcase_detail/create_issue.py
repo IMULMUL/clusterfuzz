@@ -15,11 +15,12 @@
 
 from flask import request
 
+from clusterfuzz._internal.issue_management import issue_filer
+from clusterfuzz._internal.metrics import events
 from handlers import base_handler
 from handlers.testcase_detail import show
 from libs import handler
 from libs import helpers
-from libs.issue_management import issue_filer
 
 
 class Handler(base_handler.Handler):
@@ -39,15 +40,23 @@ class Handler(base_handler.Handler):
     if cc_me:
       additional_ccs.append(user_email)
 
-    issue_id = issue_filer.file_issue(
+    issue_id, _ = issue_filer.file_issue(
         testcase,
         issue_tracker,
         security_severity=severity,
         user_email=user_email,
         additional_ccs=additional_ccs)
 
+    events.emit(
+        events.IssueFilingEvent(
+            testcase=testcase,
+            issue_tracker_project=issue_tracker.project,
+            issue_id=str(issue_id) if issue_id else None,
+            issue_created=bool(issue_id),
+            issue_reporter=user_email))
+
     if not issue_id:
-      raise helpers.EarlyExitException('Unable to create new issue.', 500)
+      raise helpers.EarlyExitError('Unable to create new issue.', 500)
 
   @handler.post(handler.JSON, handler.JSON)
   @handler.require_csrf_token

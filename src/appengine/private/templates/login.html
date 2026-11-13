@@ -17,9 +17,10 @@
 {% block import_element %}
   {% raw %}
     <script src="/private/bower_components/webcomponentsjs/webcomponents-lite.js"></script>
-    <script src="/private/bower_components/firebase/firebase.js"></script>
-    <script src="/private/bower_components/firebaseui/dist/firebaseui.js"></script>
-    <link type="text/css" rel="stylesheet" href="/private/bower_components/firebaseui/dist/firebaseui.css">
+    <script src="https://www.gstatic.com/firebasejs/9.2.0/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.2.0/firebase-auth-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/ui/6.0.0/firebase-ui-auth.js"></script>
+    <link type="text/css" rel="stylesheet" href="https://www.gstatic.com/firebasejs/ui/6.0.0/firebase-ui-auth.css" />
     <link rel="import" href="/private/bower_components/polymer/polymer.html">
     <link rel="import" href="/private/bower_components/iron-icons/iron-icons.html">
     <link rel="import" href="/private/bower_components/iron-icon/iron-icon.html">
@@ -47,6 +48,30 @@
     };
     firebase.initializeApp(config);
 
+    // Sends a Firebase verification email, asking Firebase to send the user
+    // back to this login page once they click the verification link.
+    //
+    // The continue URL only works if the current domain is listed in the
+    // Firebase project's authorized domains, which is not guaranteed for
+    // deployments serving on a custom domain. Fall back to a plain
+    // verification email in that case, so that email verification never
+    // becomes impossible because of a misconfigured continue URL.
+    function sendVerificationEmail(user) {
+      return user.sendEmailVerification({url: window.location.href}).catch(
+          function(error) {
+            var continueUrlErrors = [
+              'auth/invalid-continue-uri',
+              'auth/missing-continue-uri',
+              'auth/unauthorized-continue-uri',
+            ];
+            if (continueUrlErrors.indexOf(error.code) === -1) {
+              throw error;
+            }
+
+            return user.sendEmailVerification();
+          });
+    }
+
     var uiConfig = {
       signInOptions: [
           {
@@ -57,9 +82,35 @@
                 prompt: 'select_account',
               },
           },
+          {
+              provider: firebase.auth.GithubAuthProvider.PROVIDER_ID,
+              scopes: [
+                'user:email',
+              ]
+          },
       ],
       callbacks: {
         signInSuccessWithAuthResult: function(authResult, redirectUrl) {
+          if (!authResult.user.emailVerified) {
+            var email = authResult.user.email;
+            sendVerificationEmail(authResult.user).then(function() {
+              alert(
+                  'A verification email has been sent to ' + email +
+                  '. Please click the verification link in that email and sign in again.'
+              );
+            }).catch(function (error) {
+              alert(
+                  'Your email' + (email ? ' (' + email + ')' : '') +
+                  ' is not verified, and we could not send a verification' +
+                  ' email: ' + (error.code || error.message) +
+                  '. Please try again later.'
+              );
+            }).then(function() {
+              return firebase.auth().signOut();
+            });
+            return false;
+          }
+
           authResult.user.getIdToken().then(function(idToken) {
             var xhr = new XMLHttpRequest();
             xhr.open('POST', '/session-login');

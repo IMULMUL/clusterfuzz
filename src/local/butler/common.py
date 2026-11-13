@@ -18,21 +18,17 @@ import datetime
 import io
 import os
 import platform
+import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import urllib.request
 import zipfile
 
-from distutils import dir_util
-
+from clusterfuzz._internal.system import environment
 from local.butler import constants
-
-try:
-  from shlex import quote
-except ImportError:
-  from pipes import quote
 
 INVALID_FILENAMES = ['src/third_party/setuptools/script (dev).tmpl']
 
@@ -41,34 +37,27 @@ class GcloudError(Exception):
   """Gcloud error."""
 
 
-class GsutilError(Exception):
-  """Gsutil error."""
+class Gcloud:
+  """Gcloud runner."""
 
-
-class Gcloud(object):
-  """Project specific gcloud."""
-
-  def __init__(self, project_id):
+  def __init__(self, project_id=None, storage=False):
     self.project_id = project_id
+    self.storage = storage
 
   def run(self, *args):
-    arguments = ['gcloud', '--project=' + self.project_id]
+    """Run a gcloud command."""
+    arguments = ['gcloud']
+    if self.project_id:
+      arguments += ['--project=' + self.project_id]
+    if self.storage:
+      arguments += ['storage']
     arguments.extend(args)
     return _run_and_handle_exception(arguments, GcloudError)
 
 
-class Gsutil(object):
-  """gsutil runner."""
-
-  def run(self, *args):
-    arguments = ['gsutil']
-    arguments.extend(args)
-    return _run_and_handle_exception(arguments, GsutilError)
-
-
 def _run_and_handle_exception(arguments, exception_class):
   """Run a command and handle its error output."""
-  print('Running:', ' '.join(quote(arg) for arg in arguments))
+  print('Running:', ' '.join(shlex.quote(arg) for arg in arguments))
   try:
     return subprocess.check_output(arguments)
   except subprocess.CalledProcessError as e:
@@ -82,7 +71,8 @@ def _utcnow():
 
 def compute_staging_revision():
   """Staging revision adds 2 days to timestamp and append 'staging'."""
-  return _compute_revision(_utcnow() + datetime.timedelta(days=2), 'staging')
+  return _compute_revision(
+      _utcnow() + datetime.timedelta(days=2), is_staging=True)
 
 
 def compute_prod_revision():
@@ -90,16 +80,39 @@ def compute_prod_revision():
   return _compute_revision(_utcnow())
 
 
-def _compute_revision(timestamp, *extras):
-  """Return a revision that contains a timestamp, git-sha, user, and
-    is_staging. The ordinality of revision is crucial for updating source code.
-    Later revision *must* be greater than earlier revision. See:
-    crbug.com/674173."""
-  timestamp = timestamp.strftime('%Y%m%d%H%M%S-utc')
+def _get_clusterfuzz_commit_sha():
   _, git_sha = execute('git rev-parse --short HEAD')
-  git_sha = git_sha.strip().decode('utf-8')
+  return git_sha.strip().decode('utf-8')
 
-  components = [timestamp, git_sha, os.environ['USER']] + list(extras)
+
+def _get_clusterfuzz_config_commit_sha():
+  _, git_sha = execute(
+      f'git -C {environment.get_config_directory()} rev-parse --short HEAD')
+  return git_sha.strip().decode('utf-8')
+
+
+def _compute_revision(timestamp, is_staging=False):
+  """Return a source code revision.
+
+  This revision contains the timestamp, git-sha, user, config git-sha, and
+  appengine release (prod or staging). The ordinality of revision is crucial
+  for updating source code. Later revision *must* be greater than earlier
+  revision. See: crbug.com/674173.
+  """
+  timestamp = timestamp.strftime('%Y%m%d%H%M%S-utc')
+  clusterfuzz_git_sha = _get_clusterfuzz_commit_sha()
+
+  # Adding also the clusterfuzz-config version to the revision
+  clusterfuzz_config_git_sha = _get_clusterfuzz_config_commit_sha()
+  appengine_release = 'prod'
+  if is_staging:
+    appengine_release = 'staging'
+
+  user = os.environ['USER']
+  components = [
+      timestamp, clusterfuzz_git_sha, user, clusterfuzz_config_git_sha,
+      appengine_release
+  ]
   return '-'.join(components)
 
 
@@ -112,13 +125,16 @@ def process_proc_output(proc, print_output=True):
 
   lines = []
   for line in iter(proc.stdout.readline, b''):
-    _print('| %s' % line.rstrip().decode('utf-8'))
+    _print(f'| {line.rstrip().decode("utf-8")}')
     lines.append(line)
 
   return b''.join(lines)
 
 
-def execute_async(command, extra_environments=None, cwd=None):
+def execute_async(command,
+                  extra_environments=None,
+                  cwd=None,
+                  stderr=subprocess.STDOUT):
   """Execute a bash command asynchronously. Returns a subprocess.Popen."""
   environments = os.environ.copy()
   if extra_environments is not None:
@@ -128,7 +144,7 @@ def execute_async(command, extra_environments=None, cwd=None):
       command,
       shell=True,
       stdout=subprocess.PIPE,
-      stderr=subprocess.STDOUT,
+      stderr=stderr,
       env=environments,
       cwd=cwd)
 
@@ -137,24 +153,25 @@ def execute(command,
             print_output=True,
             exit_on_error=True,
             extra_environments=None,
-            cwd=None):
+            cwd=None,
+            stderr=subprocess.STDOUT):
   """Execute a bash command."""
 
   def _print(s):
     if print_output:
       print(s)
 
-  print_string = 'Running: %s' % command
+  print_string = f'Running: {command}'
   if cwd:
-    print_string += " (cwd='%s')" % cwd
+    print_string += f' (cwd="{cwd}")'
   _print(print_string)
 
-  proc = execute_async(command, extra_environments, cwd=cwd)
+  proc = execute_async(command, extra_environments, cwd=cwd, stderr=stderr)
   output = process_proc_output(proc, print_output)
 
   proc.wait()
   if proc.returncode != 0:
-    _print('| Return code is non-zero (%d).' % proc.returncode)
+    _print(f'| Return code is non-zero ({proc.returncode}).')
     if exit_on_error:
       _print('| Exit.')
       sys.exit(proc.returncode)
@@ -170,7 +187,7 @@ def kill_process(name):
         'wmic process where (commandline like "%%%s%%") delete' % name,
         exit_on_error=False)
   elif plt in ['linux', 'macos']:
-    execute('pkill -KILL -f "%s"' % name, exit_on_error=False)
+    execute(f'pkill -KILL -f "{name}"', exit_on_error=False)
 
 
 def is_git_dirty():
@@ -202,7 +219,10 @@ def _install_chromedriver():
   if plt == 'linux':
     archive_name = 'chromedriver_linux64.zip'
   elif plt == 'macos':
-    archive_name = 'chromedriver_mac64.zip'
+    if platform.machine() == 'arm64' or platform.processor() == 'arm':
+      archive_name = 'chromedriver_mac64_m1.zip'
+    else:
+      archive_name = 'chromedriver_mac64.zip'
   elif plt == 'windows':
     archive_name = 'chromedriver_win32.zip'
 
@@ -210,20 +230,47 @@ def _install_chromedriver():
       constants.CHROMEDRIVER_DOWNLOAD_PATTERN.format(
           version=version, archive_name=archive_name))
   archive_io = io.BytesIO(archive_request.read())
-  chromedriver_archive = zipfile.ZipFile(archive_io)
+  with zipfile.ZipFile(archive_io) as chromedriver_archive:
+    chromedriver_path = get_chromedriver_path()
+    output_directory = os.path.dirname(chromedriver_path)
+    chromedriver_binary = os.path.basename(chromedriver_path)
 
-  chromedriver_path = get_chromedriver_path()
-  output_directory = os.path.dirname(chromedriver_path)
-  chromedriver_binary = os.path.basename(chromedriver_path)
-
-  chromedriver_archive.extract(chromedriver_binary, output_directory)
+    chromedriver_archive.extract(chromedriver_binary, output_directory)
   os.chmod(chromedriver_path, 0o750)
-  print('Installed chromedriver at: %s' % chromedriver_path)
+  print(f'Installed chromedriver at: {chromedriver_path}')
 
 
 def _pip():
   """Get the pip binary name."""
   return 'pip3'
+
+
+def _pipfile_to_requirements(pipfile_dir, requirements_path, dev=False):
+  """Output a requirements.txt given a locked Pipfile."""
+  dev_arg = ''
+  if dev:
+    dev_arg = '--dev'
+
+  return_code, output = execute(
+      f'python3.11 -m pipenv requirements {dev_arg}',
+      exit_on_error=False,
+      cwd=pipfile_dir,
+      extra_environments={'PIPENV_IGNORE_VIRTUALENVS': '1'},
+      stderr=subprocess.DEVNULL)
+  if return_code != 0:
+    # Older pipenv version.
+    return_code, output = execute(
+        f'python3.11 -m pipenv lock -r --no-header {dev_arg}',
+        exit_on_error=False,
+        cwd=pipfile_dir,
+        extra_environments={'PIPENV_IGNORE_VIRTUALENVS': '1'},
+        stderr=subprocess.DEVNULL)
+
+  if return_code != 0:
+    raise RuntimeError('Failed to generate requirements from Pipfile.')
+
+  with open(requirements_path, 'wb') as f:
+    f.write(output)
 
 
 def _install_pip(requirements_path, target_path):
@@ -241,9 +288,9 @@ def _install_pip(requirements_path, target_path):
 
 def _install_platform_pip(requirements_path, target_path, platform_name):
   """Install platform specific pip packages."""
-  pip_platform = constants.PLATFORMS.get(platform_name)
+  pip_platform = constants.DEPLOYMENT_TARGETS.get(platform_name)
   if not pip_platform:
-    raise Exception('Unknown platform: %s.' % platform_name)
+    raise OSError(f'Unknown platform: {platform_name}.')
 
   # Some platforms can specify multiple pip platforms (e.g. macOS has multiple
   # SDK versions).
@@ -255,29 +302,36 @@ def _install_platform_pip(requirements_path, target_path, platform_name):
 
   pip_abi = constants.ABIS[platform_name]
 
-  for pip_platform in pip_platforms:
-    temp_dir = tempfile.mkdtemp()
-    return_code, _ = execute(
-        '{pip} download --no-deps --only-binary=:all: --platform={platform} '
-        '--abi={abi} -r {requirements_path} -d {output_dir}'.format(
-            pip=_pip(),
-            platform=pip_platform,
-            abi=pip_abi,
-            requirements_path=requirements_path,
-            output_dir=temp_dir),
-        exit_on_error=False)
+  with open(requirements_path, 'r') as f:
+    requirements = [
+        line.strip() for line in f if line.strip() and not line.startswith('#')
+    ]
 
-    if return_code != 0:
-      print('Did not find package for platform: ' + pip_platform)
-      continue
+  # Different packages on PyPI publish binary wheels targeting different macOS
+  # deployment targets (e.g. macosx_11_0 vs macosx_12_0 vs universal2). We
+  # iterate over requirements individually so each package can match its own
+  # highest compatible platform tag.
+  for req in requirements:
+    downloaded = False
+    for pip_platform_entry in pip_platforms:
+      with tempfile.TemporaryDirectory() as temp_dir:
+        return_code, _ = execute(
+            f'{_pip()} download --no-deps --only-binary=:all: '
+            f'--platform={pip_platform_entry} --abi={pip_abi} "{req}" -d '
+            f'{temp_dir}',
+            exit_on_error=False)
 
-    execute('unzip -o -d %s \'%s/*.whl\'' % (target_path, temp_dir))
-    shutil.rmtree(temp_dir, ignore_errors=True)
-    break
+        if return_code != 0:
+          print(f'Did not find {req} for platform: {pip_platform_entry}')
+          continue
 
-  if return_code != 0:
-    raise Exception('Failed to find package in supported platforms: %s' +
-                    str(pip_platforms))
+        execute(f'unzip -o -d {target_path} "{temp_dir}/*.whl"')
+        downloaded = True
+        break
+
+    if not downloaded:
+      raise RuntimeError(
+          f'Failed to find {req} in supported platforms: {pip_platforms}')
 
 
 def _remove_invalid_files():
@@ -287,8 +341,12 @@ def _remove_invalid_files():
       os.remove(name)
 
 
-def install_dependencies(platform_name=None, is_reproduce_tool_setup=False):
+def install_dependencies(platform_name=None):
   """Install dependencies for bots."""
+  _pipfile_to_requirements('src', 'src/requirements.txt')
+  # Hack: Use "dev-packages" to specify App Engine only packages.
+  _pipfile_to_requirements('src', 'src/appengine/requirements.txt', dev=True)
+
   _install_pip('src/requirements.txt', 'src/third_party')
   if platform_name:
     _install_platform_pip(
@@ -296,16 +354,7 @@ def install_dependencies(platform_name=None, is_reproduce_tool_setup=False):
         'src/third_party',
         platform_name=platform_name)
 
-  with tempfile.NamedTemporaryFile() as f:
-    f.write(open('src/requirements.txt', 'rb').read())
-    f.write(open('src/appengine/requirements.txt', 'rb').read())
-    f.flush()
-
-    _install_pip(f.name, 'src/appengine/third_party')
-
-  # Only the previous dependencies are needed for reproduce tool installation.
-  if is_reproduce_tool_setup:
-    return
+  _install_pip('src/appengine/requirements.txt', 'src/appengine/third_party')
 
   _remove_invalid_files()
   execute('bower install --allow-root')
@@ -315,7 +364,7 @@ def install_dependencies(platform_name=None, is_reproduce_tool_setup=False):
 
 def remove_symlink(target):
   """Removes a symlink."""
-  if not os.path.exists(target):
+  if not os.path.lexists(target):
     return
 
   if os.path.isdir(target) and get_platform() == 'windows':
@@ -332,16 +381,13 @@ def symlink(src, target):
   remove_symlink(target)
 
   if get_platform() == 'windows':
-    execute(r'cmd /c mklink /j %s %s' % (target, src))
+    execute(rf'cmd /c mklink /j {target} {src}')
   else:
     os.symlink(src, target)
 
-  assert os.path.exists(target), (
-      'Failed to create {target} symlink for {src}.'.format(
-          target=target, src=src))
+  assert os.path.exists(target), f'Failed to create {target} symlink for {src}.'
 
-  print('Created symlink: source: {src}, target {target}.'.format(
-      src=src, target=target))
+  print(f'Created symlink: source: {src}, target {target}.')
 
 
 def copy_dir(src, target):
@@ -362,12 +408,21 @@ def has_file_in_path(filename):
   return False
 
 
+def get_all_files(directory):
+  """Returns a list of all files recursively under a given directory."""
+  all_files = []
+  for root, _, files in os.walk(directory):
+    for filename in files:
+      filepath = os.path.join(root, filename)
+      all_files.append(filepath)
+  return all_files
+
+
 def test_bucket(env_var):
   """Get the integration test bucket."""
   bucket = os.getenv(env_var)
   if not bucket:
-    raise RuntimeError(
-        'You need to specify {var} for integration testing'.format(var=env_var))
+    raise RuntimeError(f'You need to specify {env_var} for integration testing')
 
   return bucket
 
@@ -377,7 +432,9 @@ def kill_leftover_emulators():
   kill_process('dev_appserver.py')
   kill_process('CloudDatastore.jar')
   kill_process('pubsub-emulator')
-  kill_process('run_bot')
+  # It was needed to add the "buttler.py" because I was killing
+  # the testing process for running the "run_bot_test"
+  kill_process('butler.py run_bot')
 
 
 def get_platform():
@@ -389,10 +446,29 @@ def get_platform():
   if platform.system() == 'Windows':
     return 'windows'
 
-  raise Exception('Unknown platform: %s.' % platform.system())
+  raise OSError(f'Unknown platform: {platform.system()}.')
+
+
+def get_modified_time(filename):
+  return os.stat(filename)[stat.ST_MTIME]
+
+
+def is_newer(src, dst):
+  if not os.path.exists(dst):
+    return True
+
+  src_time = get_modified_time(src)
+  dst_time = get_modified_time(dst)
+  return src_time > dst_time
+
+
+def copy_if_newer(src, dst):
+  if is_newer(src, dst):
+    return shutil.copy2(src, dst)
+  return False
 
 
 def update_dir(src_dir, dst_dir):
   """Recursively copy from src_dir to dst_dir, replacing files but only if
   they're newer or don't exist."""
-  dir_util.copy_tree(src_dir, dst_dir, update=True)
+  shutil.copytree(src_dir, dst_dir, copy_function=copy_if_newer)

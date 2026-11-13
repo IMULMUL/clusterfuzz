@@ -18,11 +18,11 @@ import threading
 import time
 import urllib.request
 
+from clusterfuzz._internal.config import local_config
+from clusterfuzz._internal.tests.test_libs import test_utils
 from local.butler import appengine
 from local.butler import common
 from local.butler import constants
-from python.config import local_config
-from python.tests.test_libs import test_utils
 
 
 def bootstrap_db():
@@ -70,11 +70,7 @@ def bootstrap_gcs(storage_path):
   create_local_bucket(local_gcs_buckets_path,
                       config.get('env.QUARANTINE_BUCKET'))
   create_local_bucket(local_gcs_buckets_path,
-                      config.get('env.SHARED_CORPUS_BUCKET'))
-  create_local_bucket(local_gcs_buckets_path,
                       config.get('env.FUZZ_LOGS_BUCKET'))
-  create_local_bucket(local_gcs_buckets_path,
-                      config.get('env.MUTATOR_PLUGINS_BUCKET'))
 
   # Symlink local GCS bucket path to appengine src dir to bypass sandboxing
   # issues.
@@ -179,14 +175,13 @@ def execute(args):
   os.environ['DATASTORE_EMULATOR_HOST'] = constants.DATASTORE_EMULATOR_HOST
   os.environ['PUBSUB_EMULATOR_HOST'] = constants.PUBSUB_EMULATOR_HOST
   os.environ['GAE_ENV'] = 'dev'
+  cron_server = common.execute_async(
+      f'gunicorn -b 127.0.0.1:{constants.CRON_SERVICE_PORT} main:app',
+      cwd=os.path.join('src', 'appengine'))
   try:
-    cron_server = common.execute_async(
-        'gunicorn -b :{port} main:app'.format(port=constants.CRON_SERVICE_PORT),
-        cwd=os.path.join('src', 'appengine'))
 
     common.execute(
-        'gunicorn -b :{port} main:app'.format(
-            port=constants.DEV_APPSERVER_PORT),
+        f'gunicorn -b {constants.DEV_APPSERVER_HOST} main:app',
         cwd=os.path.join('src', 'appengine'))
   except KeyboardInterrupt:
     print('Server has been stopped. Exit.')

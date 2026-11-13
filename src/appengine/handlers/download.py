@@ -18,15 +18,18 @@ import urllib.parse
 
 from flask import request
 
-from base import errors
-from base import utils
-from datastore import data_handler
-from google_cloud_utils import blobs
+from clusterfuzz._internal.base import dates
+from clusterfuzz._internal.base import errors
+from clusterfuzz._internal.base import utils
+from clusterfuzz._internal.datastore import data_handler
+from clusterfuzz._internal.google_cloud_utils import blobs
+from clusterfuzz._internal.issue_management import issue_tracker_utils
 from handlers import base_handler
 from libs import access
 from libs import gcs
 from libs import helpers
-from libs.issue_management import issue_tracker_utils
+
+_OSS_FUZZ_REPRODUCER_DELAY = 30
 
 
 class Handler(base_handler.Handler, gcs.SignedGcsHandler):
@@ -60,22 +63,46 @@ class Handler(base_handler.Handler, gcs.SignedGcsHandler):
     response.headers['Content-disposition'] = content_disposition
     return response
 
-  def check_public_testcase(self, blob_info, testcase):
-    """Check public testcase."""
+  def check_public_testcase(self, issue, blob_info, testcase):
+    """Check if a testcase can be downloaded publicly (without access).
+
+    Only the minimized testcase is ever served publicly, and only if the
+    associated bug has no view restrictions (i.e. it has been made public).
+
+    Gated on OSS-Fuzz and Chromium, whose bugs live on public Google Issue
+    Tracker instances (issues.oss-fuzz.com and issues.chromium.org) where an
+    unrestricted (LIMIT_NONE) bug is truly public. Other deployments (e.g.
+    internal ones) may use trackers where LIMIT_NONE doesn't mean truly public,
+    so public downloads are never allowed there.
+
+    |issue| is the already-fetched issue (or None).
+    """
+    if not utils.is_oss_fuzz() and not utils.is_chromium():
+      return False
+
     if blob_info.key() != testcase.minimized_keys:
       return False
 
-    if not testcase.bug_information:
-      return False
-
-    issue_tracker = issue_tracker_utils.get_issue_tracker_for_testcase(testcase)
-    issue = issue_tracker.get_issue(testcase.bug_information)
     if not issue:
       return False
 
+    # The bug must have been made public. This is the authoritative check: a
+    # view-restricted (e.g. embargoed security) bug must never expose its
+    # reproducer, regardless of whether it is open or closed.
+    if not issue.is_unrestricted:
+      return False
+
     # If the issue is explicitly marked as view restricted to committers only
-    # (OSS-Fuzz only), then don't allow public download.
+    # (legacy Monorail label), then don't allow public download.
     if 'restrict-view-commit' in issue.labels:
+      return False
+
+    # For OSS-Fuzz, delay the disclosure of the reproducer by 30 days.
+    # If the deadline had previously exceeded, the reproducer was made public
+    # already so exclude that case.
+    if (utils.is_oss_fuzz() and 'deadline-exceeded' not in issue.labels and
+        issue.closed_time and not dates.time_has_expired(
+            issue.closed_time, days=_OSS_FUZZ_REPRODUCER_DELAY)):
       return False
 
     return True
@@ -85,13 +112,13 @@ class Handler(base_handler.Handler, gcs.SignedGcsHandler):
     testcase = None
     testcase_id = request.args.get('testcase_id')
     if not testcase_id and not resource:
-      raise helpers.EarlyExitException('No file requested.', 400)
+      raise helpers.EarlyExitError('No file requested.', 400)
 
     if testcase_id:
       try:
         testcase = data_handler.get_testcase_by_id(testcase_id)
       except errors.InvalidTestcaseError:
-        raise helpers.EarlyExitException('Invalid testcase.', 400)
+        raise helpers.EarlyExitError('Invalid testcase.', 400)
 
       if not resource:
         if testcase.minimized_keys and testcase.minimized_keys != 'NA':
@@ -106,34 +133,40 @@ class Handler(base_handler.Handler, gcs.SignedGcsHandler):
     resource = str(urllib.parse.unquote(resource))
     blob_info = blobs.get_blob_info(resource)
     if not blob_info:
-      raise helpers.EarlyExitException('File does not exist.', 400)
+      raise helpers.EarlyExitError('File does not exist.', 400)
 
     if (testcase and testcase.fuzzed_keys != blob_info.key() and
         testcase.minimized_keys != blob_info.key()):
-      raise helpers.EarlyExitException('Invalid testcase.', 400)
-
-    if (utils.is_oss_fuzz() and testcase and
-        self.check_public_testcase(blob_info, testcase)):
-      # Public OSS-Fuzz testcase.
-      return self._send_blob(
-          blob_info,
-          testcase.key.id(),
-          is_minimized=True,
-          fuzzer_binary_name=fuzzer_binary_name)
+      raise helpers.EarlyExitError('Invalid testcase.', 400)
 
     is_minimized = testcase and blob_info.key() == testcase.minimized_keys
-    if access.has_access():
-      # User has general access.
-      return self._send_blob(blob_info, testcase_id, is_minimized,
-                             fuzzer_binary_name)
 
-    # If this blobstore file is for a testcase, check if the user has access to
-    # the testcase.
     if not testcase:
-      raise helpers.AccessDeniedException()
+      # Non-testcase blob. General access is sufficient.
+      if access.has_access():
+        return self._send_blob(blob_info, testcase_id, is_minimized,
+                               fuzzer_binary_name)
+      raise helpers.AccessDeniedError()
 
+    # Testcase blob. Check testcase-level access first (this enforces the
+    # security_flag privileged-access requirement). Authorized users are served
+    # without an issue-tracker call.
     if access.can_user_access_testcase(testcase):
       return self._send_blob(blob_info, testcase_id, is_minimized,
                              fuzzer_binary_name)
 
-    raise helpers.AccessDeniedException()
+    # Unauthorized: allow a public download only if the testcase's bug has been
+    # made public on a public issue tracker (OSS-Fuzz or Chromium). Fetch the
+    # issue once and reuse it below.
+    issue = None
+    if testcase.bug_information:
+      issue_tracker = issue_tracker_utils.get_issue_tracker_for_testcase(
+          testcase)
+      if issue_tracker:
+        issue = issue_tracker.get_issue(testcase.bug_information)
+
+    if self.check_public_testcase(issue, blob_info, testcase):
+      return self._send_blob(blob_info, testcase.key.id(), is_minimized,
+                             fuzzer_binary_name)
+
+    raise helpers.AccessDeniedError()

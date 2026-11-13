@@ -13,14 +13,14 @@
 # limitations under the License.
 """Initial datastore setup."""
 
-import six
-
+from google.api import metric_pb2
+from google.api_core import exceptions
 from google.cloud import monitoring_v3
 
-from base import utils
-from datastore import data_types
-from metrics import monitor
-from metrics import monitoring_metrics
+from clusterfuzz._internal.base import utils
+from clusterfuzz._internal.datastore import data_types
+from clusterfuzz._internal.metrics import monitor
+from clusterfuzz._internal.metrics import monitoring_metrics
 
 LIBFUZZER_TEMPLATE = """MAX_FUZZ_THREADS = 1
 MAX_TESTCASES = 2
@@ -31,18 +31,6 @@ BAD_BUILD_CHECK = False
 THREAD_ALIVE_CHECK_INTERVAL = 1
 REPORT_OOMS_AND_HANGS = True
 CORPUS_FUZZER_NAME_OVERRIDE = libFuzzer
-ENABLE_GESTURES = False
-THREAD_DELAY = 30.0
-"""
-
-SYZKALLER_TEMPLATE = """MAX_FUZZ_THREADS = 1
-MAX_TESTCASES = 1
-FUZZ_TEST_TIMEOUT = 10800
-TEST_TIMEOUT = 120
-WARMUP_TIMEOUT = 120
-BAD_BUILD_CHECK = False
-THREAD_ALIVE_CHECK_INTERVAL = 1
-REPORT_OOMS_AND_HANGS = True
 ENABLE_GESTURES = False
 THREAD_DELAY = 30.0
 """
@@ -68,6 +56,30 @@ WARMUP_TIMEOUT = 65
 BAD_BUILD_CHECK = False
 THREAD_ALIVE_CHECK_INTERVAL = 1
 CORPUS_FUZZER_NAME_OVERRIDE = libFuzzer
+ENABLE_GESTURES = False
+THREAD_DELAY = 30.0
+"""
+
+GOOGLEFUZZTEST_TEMPLATE = """MAX_FUZZ_THREADS = 1
+MAX_TESTCASES = 2
+FUZZ_TEST_TIMEOUT = 8400
+TEST_TIMEOUT = 65
+WARMUP_TIMEOUT = 65
+BAD_BUILD_CHECK = False
+THREAD_ALIVE_CHECK_INTERVAL = 1
+REPORT_OOMS_AND_HANGS = True
+ENABLE_GESTURES = False
+THREAD_DELAY = 30.0
+"""
+
+CENTIPEDE_TEMPLATE = """MAX_FUZZ_THREADS = 1
+MAX_TESTCASES = 2
+FUZZ_TEST_TIMEOUT = 8400
+TEST_TIMEOUT = 65
+WARMUP_TIMEOUT = 65
+BAD_BUILD_CHECK = False
+THREAD_ALIVE_CHECK_INTERVAL = 1
+REPORT_OOMS_AND_HANGS = True
 ENABLE_GESTURES = False
 THREAD_DELAY = 30.0
 """
@@ -110,17 +122,18 @@ PRUNE_TEMPLATE = 'CORPUS_PRUNE = True'
 
 TEMPLATES = {
     'afl': AFL_TEMPLATE,
+    'centipede': CENTIPEDE_TEMPLATE,
     'engine_asan': ENGINE_ASAN_TEMPLATE,
     'engine_msan': ENGINE_MSAN_TEMPLATE,
     'engine_ubsan': ENGINE_UBSAN_TEMPLATE,
     'honggfuzz': HONGGFUZZ_TEMPLATE,
+    'googlefuzztest': GOOGLEFUZZTEST_TEMPLATE,
     'libfuzzer': LIBFUZZER_TEMPLATE,
-    'syzkaller': SYZKALLER_TEMPLATE,
     'prune': PRUNE_TEMPLATE,
 }
 
 
-class BaseBuiltinFuzzerDefaults(object):
+class BaseBuiltinFuzzerDefaults:
   """Default values for a builtin Fuzzer data_type. Note this class should be
   inherited and should not be used directly."""
 
@@ -163,7 +176,6 @@ class LibFuzzerDefaults(BaseBuiltinFuzzerDefaults):
     # Use single quotes since the string ends in a double quote.
     # pylint: disable=line-too-long
     self.stats_column_descriptions = '''fuzzer: "Fuzz target"
-perf_report: "Link to performance analysis report"
 tests_executed: "Number of testcases executed during this time period"
 new_crashes: "Number of new unique crashes observed during this time period"
 edge_coverage: "Coverage for this fuzz target (number of edges/total)"
@@ -183,8 +195,7 @@ total_fuzzing_time_hrs: "Total time in hours for which the fuzzer(s) ran. Will b
 logs: "Link to fuzzing logs"
 corpus_backup: "Backup copy of the minimized corpus generated based on code coverage"'''
 
-    self.stats_columns = """_PERFORMANCE_REPORT as perf_report,
-sum(t.number_of_executed_units) as tests_executed,
+    self.stats_columns = """sum(t.number_of_executed_units) as tests_executed,
 custom(j.new_crashes) as new_crashes,
 _EDGE_COV as edge_coverage,
 _COV_REPORT as cov_report,
@@ -255,14 +266,54 @@ class HonggfuzzDefaults(BaseBuiltinFuzzerDefaults):
     self.key_id = 1339
 
 
-class SyzkallerDefaults(BaseBuiltinFuzzerDefaults):
-  """Default values for syzkaller."""
+class GoogleFuzzTestDefaults(BaseBuiltinFuzzerDefaults):
+  """Default values for googlefuzztest."""
 
   def __init__(self):
     super().__init__()
-    # Override empty values from parent.
-    self.name = 'syzkaller'
-    self.key_id = 1340
+    self.name = 'googlefuzztest'
+    self.key_id = 1341
+
+
+class CentipedeDefaults(BaseBuiltinFuzzerDefaults):
+  """Default values for Centipede."""
+
+  def __init__(self):
+    super().__init__()
+    self.name = 'centipede'
+    self.key_id = 1342
+    # Use single quotes since the string ends in a double quote.
+    # pylint: disable=line-too-long
+    self.stats_column_descriptions = '''fuzzer: "Fuzz target"
+tests_executed: "Number of testcases executed during this time period"
+new_crashes: "Number of new unique crashes observed during this time period"
+edge_coverage: "Coverage for this fuzz target (number of edges/total)"
+cov_report: "Link to coverage report"
+corpus_size: "Size of the minimized corpus generated based on code coverage (number of testcases and total size on disk)"
+avg_exec_per_sec: "Average number of testcases executed per second"
+fuzzing_time_percent: "Percent of expected fuzzing time that is actually spent fuzzing."
+regular_crash_percent: "Percent of fuzzing runs that had regular crashes (other than ooms, leaks, timeouts, startup and bad instrumentation crashes)"
+oom_percent: "Percent of fuzzing runs that crashed on OOMs (should be 0)"
+leak_percent: "Percent of fuzzing runs that crashed on memory leaks (should be 0)"
+timeout_percent: "Percent of fuzzing runs that had testcases timeout (should be 0)"
+total_fuzzing_time_hrs: "Total time in hours for which the fuzzer(s) ran. Will be lower if fuzzer hits a crash frequently."
+logs: "Link to fuzzing logs"
+corpus_backup: "Backup copy of the minimized corpus generated based on code coverage"'''
+
+    self.stats_columns = """sum(t.NumExecs_Max) as tests_executed,
+custom(j.new_crashes) as new_crashes,
+_EDGE_COV as edge_coverage,
+_COV_REPORT as cov_report,
+_CORPUS_SIZE as corpus_size,
+avg(t.average_exec_per_sec) as avg_exec_per_sec,
+avg(t.fuzzing_time_percent) as fuzzing_time_percent,
+avg(t.crash_count*100) as regular_crash_percent,
+avg(t.oom_count*100) as oom_percent,
+avg(t.leak_count*100) as leak_percent,
+avg(t.timeout_count*100) as timeout_percent,
+sum(t.actual_duration/3600.0) as total_fuzzing_time_hrs,
+_FUZZER_RUN_LOGS as logs,
+_CORPUS_BACKUP as corpus_backup,"""
 
 
 def setup_config(non_dry_run):
@@ -284,7 +335,8 @@ def setup_fuzzers(non_dry_run):
       AflDefaults(),
       LibFuzzerDefaults(),
       HonggfuzzDefaults(),
-      SyzkallerDefaults()
+      GoogleFuzzTestDefaults(),
+      CentipedeDefaults(),
   ]:
     fuzzer = data_types.Fuzzer.query(
         data_types.Fuzzer.name == fuzzer_defaults.name).get()
@@ -308,7 +360,7 @@ def setup_fuzzers(non_dry_run):
 
 def setup_templates(non_dry_run):
   """Set up templates."""
-  for name, template in six.iteritems(TEMPLATES):
+  for name, template in TEMPLATES.items():
     job = data_types.JobTemplate.query(
         data_types.JobTemplate.name == name).get()
     if job:
@@ -326,19 +378,26 @@ def setup_metrics(non_dry_run):
   """Set up metrics."""
   client = monitoring_v3.MetricServiceClient()
   project_name = utils.get_application_id()
-  project_path = client.project_path(project_name)
+  project_path = client.common_project_path(project_name)
 
   for name in dir(monitoring_metrics):
     metric = getattr(monitoring_metrics, name)
     if not isinstance(metric, monitor.Metric):
       continue
 
-    descriptor = monitoring_v3.types.MetricDescriptor()
+    descriptor = metric_pb2.MetricDescriptor()  # pylint: disable=no-member
     metric.monitoring_v3_metric_descriptor(descriptor)
 
     if non_dry_run:
       print('Creating metric', descriptor)
-      client.create_metric_descriptor(project_path, descriptor)
+      try:
+        client.create_metric_descriptor(
+            name=project_path, metric_descriptor=descriptor)
+      except exceptions.AlreadyExists:
+        client.delete_metric_descriptor(name=project_path +
+                                        '/metricDescriptors/' + name)
+        client.create_metric_descriptor(
+            name=project_path, metric_descriptor=descriptor)
     else:
       print('Skip creating metric', descriptor, '(dry-run mode)')
 

@@ -17,22 +17,23 @@
 # Before any other imports, we must fix the path. Some libraries might expect
 # to be able to import dependencies directly, but we must store these in
 # subdirectories of common so that they are shared with App Engine.
-from python.base import modules
+from clusterfuzz._internal.base import modules
+
 modules.fix_module_search_paths()
 
 import os
 import sys
 import time
 
-from base import dates
-from base import tasks
-from datastore import data_handler
-from datastore import data_types
-from datastore import ndb_init
-from metrics import logs
-from system import environment
-from system import process_handler
-from system import shell
+from clusterfuzz._internal.base import dates
+from clusterfuzz._internal.base import tasks
+from clusterfuzz._internal.datastore import data_handler
+from clusterfuzz._internal.datastore import data_types
+from clusterfuzz._internal.datastore import ndb_init
+from clusterfuzz._internal.metrics import logs
+from clusterfuzz._internal.system import environment
+from clusterfuzz._internal.system import process_handler
+from clusterfuzz._internal.system import shell
 
 try:
   import psutil
@@ -63,12 +64,12 @@ def beat(previous_state, log_filename):
         continue
 
       process_id = process.pid
-      logs.log(
+      logs.info(
           'Killing stale bot (pid %d) which seems to have stuck.' % process_id)
       try:
         process_handler.terminate_root_and_child_processes(process_id)
       except Exception:
-        logs.log_error('Failed to terminate stale bot processes.')
+        logs.error('Failed to terminate stale bot processes.')
 
     # Minor cleanup to avoid disk space issues on bot restart.
     process_handler.terminate_stale_application_instances()
@@ -110,7 +111,7 @@ def main():
   try:
     sys.stdout.write(str(beat(previous_state, log_filename)))
   except Exception:
-    logs.log_error('Failed to beat.')
+    logs.error('Failed to beat.')
 
   time.sleep(data_types.HEARTBEAT_WAIT_INTERVAL)
 
